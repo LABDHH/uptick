@@ -3,14 +3,14 @@
   "buildCommand": "cd web && npm install && npm run build",
   "outputDirectory": "web/dist",
   "functions": {
-    "app.py": {
+    "api/index.py": {
       "maxDuration": 300,
       "memory": 1024,
-      "excludeFiles": "{tests/**,web/node_modules/**,.venv/**,**/*.db,streamlit_version_archive.zip}"
+      "excludeFiles": "{tests/**,web/node_modules/**,web/dist/**,.venv/**,**/*.db,streamlit_version_archive.zip}"
     }
   },
   "rewrites": [
-    { "source": "/api/:path*", "destination": "/app.py" }
+    { "source": "/api/(.*)", "destination": "/api/index.py" }
   ],
   "env": {
     "UPTICK_DB": "/tmp/uptick.db",

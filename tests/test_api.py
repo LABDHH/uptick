@@ -169,9 +169,8 @@ def test_missing_key_error_names_what_to_do(monkeypatch):
 
 
 def test_vercel_entrypoint_exposes_the_app():
-    """Vercel's Python runtime looks for a top-level `app` at the project
-    root, not in api/. The re-export in app.py is what makes deploys work."""
-    from app import app as exported
+    """Vercel routes /api/* to api/index.py, which re-exports the real app."""
+    from api.index import app as exported
     import api.main as m
     assert exported is m.app
 
@@ -180,12 +179,15 @@ def test_vercel_config_is_consistent_with_the_layout():
     import json
     from pathlib import Path
 
-    cfg = json.loads((Path(__file__).resolve().parent.parent / "vercel.json").read_text())
-    # The function key must name a real entrypoint file Vercel recognises.
-    assert "app.py" in cfg["functions"]
-    assert (Path(__file__).resolve().parent.parent / "app.py").is_file()
+    root = Path(__file__).resolve().parent.parent
+    cfg = json.loads((root / "vercel.json").read_text())
+    # The function key must name a file that actually exists.
+    assert "api/index.py" in cfg["functions"]
+    assert (root / "api" / "index.py").is_file()
     # The frontend is gitignored, so Vercel must build it rather than expect it.
     assert "npm run build" in cfg["buildCommand"]
     assert cfg["outputDirectory"] == "web/dist"
     # A 47s run needs far more than the old default.
-    assert cfg["functions"]["app.py"]["maxDuration"] >= 120
+    assert cfg["functions"]["api/index.py"]["maxDuration"] >= 120
+    # Only /api/* may route to Python; everything else is the static frontend.
+    assert all(r["source"].startswith("/api") for r in cfg.get("rewrites", []))
