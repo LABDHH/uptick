@@ -168,11 +168,37 @@ def test_missing_key_error_names_what_to_do(monkeypatch):
     assert ".env" in msg
 
 
-def test_vercel_entrypoint_exposes_the_app():
-    """Vercel routes /api/* to api/index.py, which re-exports the real app."""
-    from api.index import app as exported
-    import api.main as m
-    assert exported is m.app
+@pytest.mark.asyncio
+async def test_vercel_entrypoint_accepts_both_path_forms():
+    """Vercel may deliver /api/health or a prefix-stripped /health.
+
+    Guessing wrong produced FastAPI's own 404 in production, so the
+    entrypoint normalises the path and both forms must reach the route.
+    """
+    from api.index import app as entry
+
+    async def status(path: str) -> int:
+        scope = {
+            "type": "http", "method": "GET", "path": path,
+            "raw_path": path.encode(), "headers": [(b"host", b"x")],
+            "query_string": b"", "scheme": "http", "server": ("x", 80),
+            "client": ("y", 1), "root_path": "", "http_version": "1.1",
+            "asgi": {"version": "3.0"},
+        }
+        seen = {}
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(msg):
+            if msg["type"] == "http.response.start":
+                seen["status"] = msg["status"]
+
+        await entry(scope, receive, send)
+        return seen.get("status")
+
+    assert await status("/api/health") == 200
+    assert await status("/health") == 200, "prefix-stripped path 404s again"
 
 
 def test_vercel_config_is_consistent_with_the_layout():
