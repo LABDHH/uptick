@@ -43,7 +43,13 @@ def test_limits_are_still_enforced_server_side():
 
 
 def test_streamlit_is_fully_removed():
-    """The Streamlit UI is archived; nothing should still import it."""
-    assert not (ROOT / "app.py").exists()
+    """The Streamlit UI is archived; nothing should still import it.
+
+    app.py exists again, but as the Vercel entrypoint that re-exports the
+    FastAPI app, so this checks for Streamlit itself rather than a filename.
+    """
     assert not (ROOT / "theme.py").exists()
     assert "streamlit" not in (ROOT / "requirements.txt").read_text().lower()
+    root_app = ROOT / "app.py"
+    if root_app.exists():
+        assert "streamlit" not in root_app.read_text().lower()

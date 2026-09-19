@@ -166,3 +166,26 @@ def test_missing_key_error_names_what_to_do(monkeypatch):
     msg = frames[0][1]["message"]
     assert "YOUTUBE_API_KEY" in msg and "GEMINI_API_KEY" in msg
     assert ".env" in msg
+
+
+def test_vercel_entrypoint_exposes_the_app():
+    """Vercel's Python runtime looks for a top-level `app` at the project
+    root, not in api/. The re-export in app.py is what makes deploys work."""
+    from app import app as exported
+    import api.main as m
+    assert exported is m.app
+
+
+def test_vercel_config_is_consistent_with_the_layout():
+    import json
+    from pathlib import Path
+
+    cfg = json.loads((Path(__file__).resolve().parent.parent / "vercel.json").read_text())
+    # The function key must name a real entrypoint file Vercel recognises.
+    assert "app.py" in cfg["functions"]
+    assert (Path(__file__).resolve().parent.parent / "app.py").is_file()
+    # The frontend is gitignored, so Vercel must build it rather than expect it.
+    assert "npm run build" in cfg["buildCommand"]
+    assert cfg["outputDirectory"] == "web/dist"
+    # A 47s run needs far more than the old default.
+    assert cfg["functions"]["app.py"]["maxDuration"] >= 120
