@@ -265,6 +265,21 @@ def quota_status() -> dict:
     }
 
 
+# True when the SQLite file lives somewhere that does not persist or is not
+# shared between instances (serverless /tmp). The ledger still works inside one
+# instance, but the daily total is undercounted across several, so the 90 call
+# stop can be passed. Surfaced rather than silent because the consequence is a
+# blown YouTube quota.
+EPHEMERAL_LEDGER = DB_PATH.startswith("/tmp") or bool(
+    os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+)
+
+
+def ledger_is_reliable() -> bool:
+    """False on serverless, where each instance keeps its own ledger."""
+    return not EPHEMERAL_LEDGER
+
+
 def can_spend(search_calls: int = 0, units: int = 0) -> bool:
     s = quota_status()
     if s["search_calls_used"] + search_calls > SEARCH_BLOCK_AT:

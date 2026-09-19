@@ -278,6 +278,9 @@ async def demo():
 async def health():
     return {
         "ok": True,
+        # False on serverless: each instance keeps its own quota ledger, so
+        # the daily search stop under-counts across instances.
+        "quota_ledger_reliable": cache.ledger_is_reliable(),
         "keys_configured": bool(
             os.environ.get("YOUTUBE_API_KEY") and os.environ.get("GEMINI_API_KEY")
         ),
