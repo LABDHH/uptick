@@ -202,18 +202,63 @@ def test_vercel_config_is_consistent_with_the_layout():
     assert (root / "api" / "index.py").is_file()
     # The frontend is gitignored, so Vercel must build it rather than expect it.
     assert "npm run build" in cfg["buildCommand"]
-    assert cfg["outputDirectory"] == "web/dist"
     # A 47s run needs far more than the old default.
     assert cfg["functions"]["api/index.py"]["maxDuration"] >= 120
+
+    # No rewrites. fastapi in requirements.txt makes Vercel detect the FastAPI
+    # framework preset, which takes precedence over file-based /api functions
+    # and already sends every request to this app with its path intact. A
+    # rewrite with a fixed destination REPLACES that path: /api/health arrived
+    # as the literal destination, matched no route, and returned FastAPI's own
+    # {"detail":"Not Found"} for every call.
+    assert not cfg.get("rewrites"), "a fixed rewrite destination overwrites the request path"
+    # The preset serves everything through the function; there is no static
+    # output directory, and setting one is what hid that fact.
+    assert "outputDirectory" not in cfg
 
     # The pipeline modules sit at the repo root and are imported only after a
     # runtime sys.path insert, which Vercel's static tracer cannot follow. If
     # they are not named here they are missing from the bundle and every route
     # dies on ModuleNotFoundError before routing is ever reached.
     included = cfg["functions"]["api/index.py"].get("includeFiles", "")
+    excluded = cfg["functions"]["api/index.py"].get("excludeFiles", "")
     for mod in ("cache.py", "graph.py", "agents.py", "metrics.py",
                 "youtube.py", "prompts.py", "schemas.py", "demo_data.py"):
         assert mod in included, f"{mod} would be missing from the function bundle"
         assert (root / mod).is_file()
-    # Only /api/* may route to Python; everything else is the static frontend.
-    assert all(r["source"].startswith("/api") for r in cfg.get("rewrites", []))
+
+    # The built frontend is served BY the function, so it has to ship with it.
+    # It was previously in excludeFiles, which stripped it from the bundle.
+    assert "web/dist/**" in included
+    assert "web/dist" not in excluded
+    assert "web/node_modules/**" in excluded, "node_modules would blow the bundle limit"
+
+
+def test_frontend_is_mounted_even_on_serverless(monkeypatch):
+    """Vercel's FastAPI preset routes every request here, including "/".
+
+    Nothing else serves web/dist in that setup, so the old guard that skipped
+    the static mount whenever VERCEL was set left the site root answering
+    FastAPI's own {"detail":"Not Found"}. The mount must not depend on the
+    environment.
+    """
+    import importlib
+    from pathlib import Path
+
+    import api.main as m
+
+    if not (Path(m.__file__).resolve().parent.parent / "web" / "dist").is_dir():
+        pytest.skip("frontend not built")
+
+    monkeypatch.setenv("VERCEL", "1")
+    try:
+        reloaded = importlib.reload(m)
+        assert any(getattr(r, "name", None) == "web" for r in reloaded.app.routes), \
+            "the frontend must be mounted in production too"
+        # The API must still win: its routes are declared before the mount.
+        from fastapi.testclient import TestClient
+        with TestClient(reloaded.app) as c:
+            assert c.get("/api/health").status_code == 200
+    finally:
+        monkeypatch.delenv("VERCEL", raising=False)
+        importlib.reload(m)

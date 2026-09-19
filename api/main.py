@@ -288,11 +288,15 @@ async def health():
 
 
 # Serve the built frontend when it exists, so production is ONE service.
-# Serve the built frontend ONLY when running as a normal server (uvicorn
-# locally, or a container host). On Vercel the CDN serves web/dist directly
-# and this function handles /api/* alone, so mounting StaticFiles at "/" there
-# would shadow the API routes inside the function bundle.
-_ON_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+#
+# This mount must run on Vercel too. Vercel detects FastAPI from requirements
+# and deploys the whole app as a single function, and a framework preset takes
+# precedence over file-based /api functions: every request reaches this app,
+# including "/". Nothing else serves web/dist there, so skipping the mount in
+# production left "/" answering FastAPI's own 404.
+#
+# Mounting at "/" does not shadow the API, because Starlette matches routes in
+# declaration order and every /api route above is declared before this line.
 _dist = Path(__file__).resolve().parent.parent / "web" / "dist"
-if _dist.is_dir() and not _ON_SERVERLESS:
+if _dist.is_dir():
     app.mount("/", StaticFiles(directory=str(_dist), html=True), name="web")

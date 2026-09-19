@@ -1,18 +1,14 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "buildCommand": "cd web && npm install && npm run build",
-  "outputDirectory": "web/dist",
   "functions": {
     "api/index.py": {
       "maxDuration": 300,
       "memory": 1024,
-      "includeFiles": "{agents.py,cache.py,demo_data.py,graph.py,metrics.py,prompts.py,schemas.py,youtube.py}",
-      "excludeFiles": "{tests/**,web/node_modules/**,web/dist/**,.venv/**,**/*.db,**/*.db-shm,**/*.db-wal,streamlit_version_archive.zip}"
+      "includeFiles": "{agents.py,cache.py,demo_data.py,graph.py,metrics.py,prompts.py,schemas.py,youtube.py,web/dist/**}",
+      "excludeFiles": "{tests/**,web/node_modules/**,web/src/**,.venv/**,**/*.db,**/*.db-shm,**/*.db-wal,streamlit_version_archive.zip}"
     }
   },
-  "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/index.py" }
-  ],
   "env": {
     "UPTICK_DB": "/tmp/uptick.db",
     "UPTICK_CHECKPOINTS": "/tmp/checkpoints.db"

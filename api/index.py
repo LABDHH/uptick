@@ -1,9 +1,18 @@
-"""Vercel serverless entrypoint.
+"""Vercel entrypoint.
 
-Vercel's Python runtime imports this file and looks for a module-level ASGI
-application named `app`. It must be the application object itself: a coroutine
-function named `app` is not detected as ASGI, which is what previously left the
-function answering FastAPI's own 404 ({"detail":"Not Found"}) for every path.
+`fastapi` in requirements.txt makes Vercel detect the FastAPI framework preset,
+which takes precedence over file-based /api functions: the whole app deploys as
+one function and every request reaches it with its path unchanged, "/" included.
+`api/index.py` is one of the filenames the preset accepts as an entrypoint, and
+it is tried before `api/main.py`.
+
+Because the path arrives unchanged, nothing here may rewrite it, and vercel.json
+must declare no rewrites. A rewrite with a fixed destination REPLACES the path
+the function sees, which is what made every route return FastAPI's own 404
+({"detail":"Not Found"}).
+
+Vercel looks for a module-level ASGI application named `app`, and it must be the
+application object itself: a coroutine function named `app` is not detected.
 
 Two things have to happen before `app` can be bound:
 
