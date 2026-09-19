@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root { color-scheme: light dark; }
+  html { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+  body {
+    @apply bg-surf-page text-ink font-sans;
+    background-image:
+      radial-gradient(60rem 30rem at 88% -12%, rgba(124,92,255,.10), transparent 60%),
+      radial-gradient(44rem 26rem at -8% 4%, rgba(255,107,90,.07), transparent 62%);
+    background-attachment: fixed;
+  }
+  .dark body {
+    @apply text-slate-100;
+    background-color: #0a0c16;
+    background-image:
+      radial-gradient(60rem 30rem at 88% -12%, rgba(124,92,255,.18), transparent 60%),
+      radial-gradient(44rem 26rem at -8% 4%, rgba(255,107,90,.10), transparent 62%);
+  }
+}
+
+@layer components {
+  .card { @apply rounded-xl2 border border-line bg-surf shadow-card transition-all duration-200; }
+  .dark .card { @apply border-white/10 bg-white/[.04] shadow-none backdrop-blur-sm; }
+
+  .pill {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-1
+           text-[11.5px] font-semibold leading-none;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl border border-line-strong
+           bg-surf px-4 py-2.5 text-sm font-semibold text-ink transition-all duration-150
+           hover:-translate-y-px hover:border-grape-500 hover:text-grape-600
+           active:translate-y-0 disabled:pointer-events-none disabled:opacity-40;
+  }
+  .dark .btn { @apply border-white/10 bg-white/[.05] text-slate-100 hover:border-grape-300 hover:text-grape-300; }
+
+  .btn-primary {
+    @apply border-transparent bg-gradient-to-br from-grape-500 to-grape-700 text-white
+           shadow-glow hover:border-transparent hover:text-white hover:brightness-110;
+  }
+  .dark .btn-primary { @apply border-transparent text-white; }
+
+  .label { @apply text-[10.5px] font-bold uppercase tracking-[0.1em] text-ink-faint; }
+  .dark .label { @apply text-slate-400; }
+
+  .muted { @apply text-ink-soft; }
+  .dark .muted { @apply text-slate-400; }
+}
+
+*:focus-visible { outline: 2px solid #7c5cff; outline-offset: 2px; border-radius: 8px; }
+
+.shine { position: relative; overflow: hidden; }
+.shine::after {
+  content: ""; position: absolute; inset: 0; transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(124,92,255,.22), transparent);
+  animation: slide 1.5s infinite;
+}
+@keyframes slide { 100% { transform: translateX(100%); } }
+
+/* Scrollbar that matches the surface */
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-thumb { background: #d5d9e4; border-radius: 99px; border: 3px solid transparent; background-clip: content-box; }
+.dark ::-webkit-scrollbar-thumb { background: #2b3350; background-clip: content-box; }
