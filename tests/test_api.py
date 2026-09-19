@@ -169,36 +169,26 @@ def test_missing_key_error_names_what_to_do(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_vercel_entrypoint_accepts_both_path_forms():
-    """Vercel may deliver /api/health or a prefix-stripped /health.
+async def test_vercel_entrypoint_exposes_an_asgi_app():
+    """Vercel's Python runtime binds a module-level ASGI app named `app`.
 
-    Guessing wrong produced FastAPI's own 404 in production, so the
-    entrypoint normalises the path and both forms must reach the route.
+    A coroutine function named `app` is not detected as ASGI, which left every
+    path answering FastAPI's own 404 ({"detail":"Not Found"}) in production.
+    The entrypoint must therefore export the application object itself, with
+    the /api routes reachable at the path Vercel forwards unchanged.
     """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
     from api.index import app as entry
 
-    async def status(path: str) -> int:
-        scope = {
-            "type": "http", "method": "GET", "path": path,
-            "raw_path": path.encode(), "headers": [(b"host", b"x")],
-            "query_string": b"", "scheme": "http", "server": ("x", 80),
-            "client": ("y", 1), "root_path": "", "http_version": "1.1",
-            "asgi": {"version": "3.0"},
-        }
-        seen = {}
+    assert isinstance(entry, FastAPI), "entrypoint must export an ASGI app object"
 
-        async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
+    paths = {r.path for r in entry.routes}
+    assert {"/api/health", "/api/search", "/api/demo"} <= paths
 
-        async def send(msg):
-            if msg["type"] == "http.response.start":
-                seen["status"] = msg["status"]
-
-        await entry(scope, receive, send)
-        return seen.get("status")
-
-    assert await status("/api/health") == 200
-    assert await status("/health") == 200, "prefix-stripped path 404s again"
+    with TestClient(entry) as c:
+        assert c.get("/api/health").status_code == 200
 
 
 def test_vercel_config_is_consistent_with_the_layout():
@@ -215,5 +205,15 @@ def test_vercel_config_is_consistent_with_the_layout():
     assert cfg["outputDirectory"] == "web/dist"
     # A 47s run needs far more than the old default.
     assert cfg["functions"]["api/index.py"]["maxDuration"] >= 120
+
+    # The pipeline modules sit at the repo root and are imported only after a
+    # runtime sys.path insert, which Vercel's static tracer cannot follow. If
+    # they are not named here they are missing from the bundle and every route
+    # dies on ModuleNotFoundError before routing is ever reached.
+    included = cfg["functions"]["api/index.py"].get("includeFiles", "")
+    for mod in ("cache.py", "graph.py", "agents.py", "metrics.py",
+                "youtube.py", "prompts.py", "schemas.py", "demo_data.py"):
+        assert mod in included, f"{mod} would be missing from the function bundle"
+        assert (root / mod).is_file()
     # Only /api/* may route to Python; everything else is the static frontend.
     assert all(r["source"].startswith("/api") for r in cfg.get("rewrites", []))
