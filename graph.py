@@ -23,7 +23,10 @@ import metrics
 import youtube
 from agents import clean_text
 
-MAX_CANDIDATES = 40
+# Enrichment and Stage B both scale with this. Twenty-four still gives the
+# judges a wide field to compare within (the ranking depends on relative
+# comparison) while keeping each model call small enough to return quickly.
+MAX_CANDIDATES = int(os.environ.get("UPTICK_MAX_CANDIDATES", "24"))
 # Search calls are the binding constraint: 100 per day, project wide.
 # Four per brief keeps at least 20 briefs a day available while still covering
 # the paid-placement pool plus the category, audience-space and competitor
@@ -627,7 +630,9 @@ def build_graph(yt_key: str, gemini_key: str, checkpointer=None):
         """Agent 11: the last check, on the shortlist as a whole."""
         if state.get("fatal") or not state.get("scored"):
             return {}
-        rows = graph_apply_audit_preview(state)
+        # Scored rows only: this now runs beside narrate/audit, so the
+        # rationales are deliberately not awaited.
+        rows = list(state.get("scored") or [])
         try:
             return {"review": await agents.agent11_review_shortlist(
                 g, rows, state["intent"], state.get("market"))}
@@ -654,9 +659,12 @@ def build_graph(yt_key: str, gemini_key: str, checkpointer=None):
         b.add_node(name, fn)
 
     b.add_edge(START, "interpret")
+    # research and strategize both depend only on the intent, so they run
+    # side by side. discover waits for both.
     b.add_edge("interpret", "research")
-    b.add_edge("research", "strategize")
+    b.add_edge("interpret", "strategize")
     b.add_edge("strategize", "discover")
+    b.add_edge("research", "discover")
     b.add_edge("discover", "enrich")
     b.add_edge("enrich", "dossier")
 
@@ -664,9 +672,13 @@ def build_graph(yt_key: str, gemini_key: str, checkpointer=None):
         b.add_edge("dossier", n)   # fan-out
         b.add_edge(n, "score")     # fan-in — score waits for all five
 
+    # narrate -> audit is a real dependency: the auditor checks the prose.
+    # The reviewer only reads the scored rows, so it runs alongside them
+    # instead of waiting, which takes its cost off the critical path.
     b.add_edge("score", "narrate")
     b.add_edge("narrate", "audit")
-    b.add_edge("audit", "review")
+    b.add_edge("score", "review")
+    b.add_edge("audit", END)
     b.add_edge("review", END)
 
     return b.compile(checkpointer=checkpointer)

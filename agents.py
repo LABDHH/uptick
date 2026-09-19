@@ -39,7 +39,7 @@ MAX_OUTPUT_TOKENS = 32768
 # six-field agents emit ~120 tokens/candidate of OUTPUT. Eight keeps both
 # sides comfortable while still judging enough candidates together for the
 # relative comparison to mean something.
-STAGE_B_BATCH = 8
+STAGE_B_BATCH = int(os.environ.get("UPTICK_BATCH", "12"))
 
 # 5s => 12 RPM, under the 15 RPM ceiling with room for a repair retry.
 THROTTLE_SECONDS = 5.0
@@ -401,25 +401,32 @@ async def call_batched(
     merged: dict[str, dict] = {}
     errors: list[str] = []
 
-    i = 0
-    while i < len(batches):
-        batch_ids = batches[i]
+    async def run_batch(batch_ids: list[str]) -> None:
+        """One batch, splitting itself in half if the response truncates.
+
+        Recursive rather than iterative so that a split runs its two halves
+        concurrently too: the old loop awaited every batch in turn, which made
+        an agent with five batches take five times as long as it needed to.
+        """
         sub = {k: dossier[k] for k in batch_ids}
         key = f"{dhash}:{len(batch_ids)}:{batch_ids[0][-6:]}" if dhash else None
         try:
             out = await g.call(agent_name, system, build_payload(sub), schema, temp, key)
             merged.update(reconcile(out.get("results"), set(sub), float_fields))
         except OutputTruncated:
-            # Split this batch in half and retry the halves. Bounded: a batch
-            # of one cannot be split further.
             if len(batch_ids) > 1:
                 mid = len(batch_ids) // 2
-                batches[i : i + 1] = [batch_ids[:mid], batch_ids[mid:]]
-                continue
-            errors.append(f"{batch_ids[0]}: response truncated even alone")
+                await asyncio.gather(
+                    run_batch(batch_ids[:mid]), run_batch(batch_ids[mid:])
+                )
+            else:
+                errors.append(f"{batch_ids[0]}: response truncated even alone")
         except AgentFailure as e:
             errors.append(str(e))
-        i += 1
+
+    # All batches at once. The rate limiter is the only thing that should
+    # serialize these, and it admits everything that fits inside the minute.
+    await asyncio.gather(*[run_batch(b) for b in batches])
 
     # Partial success is still success: a batch that failed simply contributes
     # no rows, and score_candidates treats a missing row as neutral.
