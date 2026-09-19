@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 
-/** A fill-in-the-blanks brief. Copying this beats staring at an empty box. */
 /**
  * One sentence with fill-in slots, not a form.
  *
@@ -9,7 +8,7 @@ import { useEffect, useRef, useState } from "react";
  * from prose that explains WHO the buyer is than from "Audience: Gen Z".
  */
 const TEMPLATE =
-  "[Brand name] sells [product] in [country or city]. " +
+  "[Brand name] sells [product] in [country]. " +
   "We want to reach [who the buyer is and when they use it]. " +
   "Looking for [creator size or style], avoiding [what to rule out].";
 
@@ -17,7 +16,7 @@ const EXAMPLES = [
   {
     emoji: "🍦",
     title: "Gelato, India",
-    text: "Frost & Co sells artisanal gelato in Mumbai, Bengaluru and Delhi. " +
+    text: "Frost & Co sells artisanal gelato in India. " +
       "We want to reach students and young professionals who go out for " +
       "dessert with friends on weekends. Looking for creators with a young " +
       "urban following, avoiding channels aimed at families with kids.",
@@ -54,7 +53,6 @@ export default function SearchPanel({
     setBrief(TEMPLATE);
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
-    // Put the cursor after "Product: " so typing starts in the right place.
     requestAnimationFrame(() => {
       const el = ref.current;
       if (!el) return;
