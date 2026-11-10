@@ -4,7 +4,7 @@ import ProgressView from "./components/ProgressView";
 import SearchPanel from "./components/SearchPanel";
 import ReviewPanel from "./components/ReviewPanel";
 import SummaryBar from "./components/SummaryBar";
-import { loadDemo, runSearch } from "./lib/api";
+import { runSearch } from "./lib/api";
 import type { Progress, Results } from "./types";
 
 function sessionId(): string {
@@ -53,13 +53,6 @@ export default function App() {
     finally { setBusy(false); setProgress(null); }
   }
 
-  async function demo() {
-    setBusy(true); setError(null);
-    try { setResults(await loadDemo()); if (!brief) setBrief("protein bar brand, India, Gen Z"); }
-    catch (e) { setError(e instanceof Error ? e.message : "Could not load the example."); }
-    finally { setBusy(false); }
-  }
-
   const ranked = useMemo(() => {
     const rows = [...(results?.ranked ?? [])];
     if (sort === "reach") rows.sort((a, b) => (b.metrics.median_views ?? 0) - (a.metrics.median_views ?? 0));
@@ -80,10 +73,20 @@ export default function App() {
     market_researcher:
       "Background research on the brand and market was unavailable, so the search worked from your brief alone.",
     rationale_writer:
-      "The written explanations could not be generated, so each creator shows its metric breakdown instead.",
+      "The written explanations could not be generated, so each creator shows a plain summary built from their numbers instead.",
     output_auditor:
-      "The fact-check on the written explanations could not run, so those explanations were withheld.",
+      "The written explanations could not be double-checked, so each creator shows a plain summary built from their numbers instead.",
     shortlist_reviewer: "The overall review of this shortlist could not be generated.",
+    persona_builder:
+      "The buyer profile could not be built, so creators were found from the market research searches and judged against your brief directly.",
+    creator_scout:
+      "The web scout for named creators was unavailable, so creators came from trending charts and YouTube search.",
+    prescreener:
+      "The quick audience pre-screen was unavailable, so creators were studied in order of how much evidence surfaced them.",
+    relevance_judge:
+      "Product and brand fit could not be judged, so the ranking leans on audience fit and channel strength.",
+    audience_analyst:
+      "Audience inference was unavailable, so the ranking leans on product fit, brand fit and channel strength.",
   };
 
   const degraded = useMemo(
@@ -143,7 +146,7 @@ export default function App() {
               actually observe and a rationale checked against the real numbers.
             </p>
             <div className="mx-auto mt-8 max-w-2xl text-left">
-              <SearchPanel brief={brief} setBrief={setBrief} onSearch={search} onDemo={demo} busy={busy} />
+              <SearchPanel brief={brief} setBrief={setBrief} onSearch={search} busy={busy} />
             </div>
           </section>
         )}
@@ -158,7 +161,7 @@ export default function App() {
                          text-ink-faint transition hover:text-grape-600 disabled:opacity-40">
               <span aria-hidden>&larr;</span> New search
             </button>
-            <SearchPanel brief={brief} setBrief={setBrief} onSearch={search} onDemo={demo}
+            <SearchPanel brief={brief} setBrief={setBrief} onSearch={search}
                          busy={busy} compact />
           </div>
         )}
@@ -170,13 +173,6 @@ export default function App() {
             <Note tone="coral" title="Search failed.">{error}</Note>
           )}
 
-          {hasResults && results!.demo && (
-            <Note title="Sample results.">
-              Example creators scored by the real ranking engine, so every score and
-              breakdown below is genuinely computed.
-            </Note>
-          )}
-
           {hasResults && results!.intent?.geo_granularity === "sub_country" && (
             <Note tone="sun" title="Sub-country targeting is not available.">
               You asked for <b>{results!.intent.geo_raw}</b>. The search ran at country
@@ -186,8 +182,8 @@ export default function App() {
 
           {hasResults && !!degraded.length && (
             <Note tone="sun" title="Some enrichment was unavailable.">
-              {degraded.join(" ")} The ranking itself is unaffected: it rests on
-              measured YouTube metrics, which were collected in full.
+              {degraded.join(" ")} Creators are still ranked: anything that could
+              not be judged counts as neutral, never against them.
             </Note>
           )}
         </div>
@@ -200,6 +196,34 @@ export default function App() {
               <div className="mt-4">
                 <ReviewPanel r={results!} />
               </div>
+            )}
+
+            {!!results!.persona?.archetypes?.length && (
+              <details className="card mt-4 p-4 text-[13.5px]">
+                <summary className="cursor-pointer font-semibold">
+                  Who we looked for
+                  {results!.persona.brand_profile?.tone && (
+                    <span className="font-normal muted">
+                      {" "}· {results!.persona.brand_profile.tone}
+                      {results!.persona.brand_profile.price_tier
+                        ? `, ${results!.persona.brand_profile.price_tier}` : ""} brand
+                    </span>
+                  )}
+                </summary>
+                <ul className="mt-3 space-y-1.5">
+                  {results!.persona.archetypes.map((a) => (
+                    <li key={a.name} className="leading-relaxed">
+                      <b>{a.name}.</b> <span className="muted">{a.why_audience_matches}</span>
+                    </li>
+                  ))}
+                </ul>
+                {!!results!.persona.product_moments?.length && (
+                  <p className="mt-3 muted">
+                    <b className="text-ink dark:text-slate-100">Where the product fits: </b>
+                    {results!.persona.product_moments.join("; ")}.
+                  </p>
+                )}
+              </details>
             )}
 
             {ranked.length === 0 ? (
@@ -251,8 +275,7 @@ export default function App() {
                 {!!results!.held_back?.note && (
                   <p className="mt-4 rounded-xl border border-dashed border-line px-4 py-3
                                 text-[13px] leading-relaxed muted dark:border-white/10">
-                    {results!.held_back.note} We would rather show a short list we
-                    can defend than pad it out.
+                    {results!.held_back.note}
                   </p>
                 )}
               </>
@@ -276,12 +299,29 @@ export default function App() {
             )}
 
             {(!!results!.cultural_sources.length || !!results!.market_sources?.length) && (
-              <p className="mt-8 text-[12px] leading-relaxed text-ink-faint">
-                Research drew on:{" "}
-                {[...(results!.market_sources ?? []), ...results!.cultural_sources]
-                  .filter((v, i, arr) => arr.indexOf(v) === i)
-                  .slice(0, 10).join(", ")}
-              </p>
+              <details className="mt-8 text-[12.5px] leading-relaxed text-ink-faint">
+                <summary className="cursor-pointer font-semibold transition hover:text-grape-600">
+                  Websites we read to research your brand and these creators
+                </summary>
+                <p className="mt-2">
+                  Before searching YouTube, we read about your brand, its competitors and
+                  what your buyers watch, and checked each creator's reputation outside
+                  YouTube. These are the sites that research drew on:
+                </p>
+                <ul className="mt-2 flex flex-wrap gap-x-3 gap-y-1">
+                  {[...(results!.market_sources ?? []), ...results!.cultural_sources]
+                    .filter((v, i, arr) => arr.indexOf(v) === i)
+                    .slice(0, 16)
+                    .map((d) => (
+                      <li key={d}>
+                        <a href={`https://${d}`} target="_blank" rel="noreferrer"
+                           className="underline decoration-dotted underline-offset-2 hover:text-grape-600">
+                          {d}
+                        </a>
+                      </li>
+                    ))}
+                </ul>
+              </details>
             )}
           </section>
         )}
@@ -292,8 +332,10 @@ export default function App() {
           </summary>
           <p className="mt-2.5 max-w-[70ch] leading-relaxed muted">
             Geography is <b>country-level only</b>, YouTube exposes no state or city data.
-            <b> No audience demographics exist</b> publicly, so nothing here describes viewer
-            age, gender or income. Engagement is a <b>proxy for attention, not predicted ROI</b>.
+            <b> No audience demographics exist</b> publicly. Where a creator's audience is
+            described (age, life stage, language), it is <b>inferred from their videos and
+            viewer comments</b>, labelled as such, and quoted from the evidence; it is never
+            measured data. Engagement is a <b>proxy for attention, not predicted ROI</b>.
             Sponsorship disclosure is <b>self-declared and under-reported</b>, so absence of
             evidence is not evidence a creator takes no deals.
           </p>

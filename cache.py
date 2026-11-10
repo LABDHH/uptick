@@ -99,6 +99,22 @@ def init_db() -> None:
             search_calls_used INTEGER NOT NULL DEFAULT 0,
             units_used INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS spend_ledger (
+            month TEXT PRIMARY KEY,
+            micro_usd INTEGER NOT NULL DEFAULT 0,
+            runs INTEGER NOT NULL DEFAULT 0,
+            grounded_queries INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS trending_snapshot (
+            date_pt TEXT NOT NULL,
+            region TEXT NOT NULL,
+            category_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            PRIMARY KEY (date_pt, region, category_id, channel_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_trending_channel
+            ON trending_snapshot(region, channel_id);
         CREATE TABLE IF NOT EXISTS agent_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT,
@@ -111,6 +127,10 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_agentlog_run ON agent_log(run_id);
         """
     )
+    cols = {r[1] for r in c.execute("PRAGMA table_info(spend_ledger)")}
+    if "grounded_queries" not in cols:
+        c.execute("ALTER TABLE spend_ledger ADD COLUMN "
+                  "grounded_queries INTEGER NOT NULL DEFAULT 0")
     c.commit()
 
 
@@ -329,7 +349,60 @@ def prune(max_age_days: int = 3) -> None:
     c.execute("DELETE FROM agent_log WHERE created_at < ?", (cutoff,))
     c.execute("DELETE FROM quota_ledger WHERE date_pt < ?",
               ((datetime.now(_PACIFIC) - timedelta(days=7)).strftime("%Y-%m-%d"),))
+    # Trending history is kept longer: its whole value is the 14-day window.
+    # Thirty days stays inside YouTube's refresh-or-delete policy.
+    c.execute("DELETE FROM trending_snapshot WHERE date_pt < ?",
+              ((datetime.now(_PACIFIC) - timedelta(days=30)).strftime("%Y-%m-%d"),))
     c.commit()
+
+
+# ---------------------------------------------------------------- trending history
+
+TRENDING_WINDOW_DAYS = 14
+
+
+def record_trending(region: str, category_id: str | None, channel_ids: list[str]) -> None:
+    """Store today's chart for this region and category, once per day.
+
+    One day on the chart is a spike. Showing up on many days is standing,
+    which is what a brand booking a creator actually wants.
+    """
+    today = pacific_date()
+    rows = [
+        (today, region or "", category_id or "", cid, rank)
+        for rank, cid in enumerate(dict.fromkeys(channel_ids), start=1)
+    ]
+    if not rows:
+        return
+    c = _conn()
+    c.executemany(
+        "INSERT OR IGNORE INTO trending_snapshot "
+        "(date_pt, region, category_id, channel_id, rank) VALUES (?,?,?,?,?)",
+        rows,
+    )
+    c.commit()
+
+
+def trending_days(region: str, channel_ids: list[str],
+                  window: int = TRENDING_WINDOW_DAYS) -> dict[str, int]:
+    """Distinct days in the window each channel appeared on any chart."""
+    ids = list(dict.fromkeys(channel_ids))
+    if not ids:
+        return {}
+    since = (datetime.now(_PACIFIC) - timedelta(days=window - 1)).strftime("%Y-%m-%d")
+    out: dict[str, int] = {}
+    c = _conn()
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        q = ",".join("?" * len(chunk))
+        for row in c.execute(
+            f"SELECT channel_id, COUNT(DISTINCT date_pt) FROM trending_snapshot "
+            f"WHERE region = ? AND date_pt >= ? AND channel_id IN ({q}) "
+            f"GROUP BY channel_id",
+            (region or "", since, *chunk),
+        ):
+            out[row[0]] = int(row[1])
+    return out
 
 
 def log_agent(run_id: str, agent_name: str, latency_ms: int, status: str) -> None:

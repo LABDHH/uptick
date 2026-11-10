@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import budget         # noqa: E402
 import cache          # noqa: E402
 import demo_data      # noqa: E402
 import graph as graph_mod  # noqa: E402
@@ -68,8 +69,10 @@ def _load_keys(root: Path | None = None) -> None:
 _load_keys()
 
 # Per-session query cap, enforced server side. The browser cannot be trusted
-# with this, so the session id is issued here and counted here.
-SESSION_QUERY_CAP = 5
+# with this, so the session id is issued here and counted here. The monthly
+# spend gate (budget.py) is the real limit; this only stops one visitor from
+# using up the month on their own.
+SESSION_QUERY_CAP = int(os.environ.get("UPTICK_SESSION_CAP", "5"))
 _session_counts: dict[str, int] = {}
 
 app = FastAPI(title="Uptick API", version="1.0")
@@ -109,15 +112,19 @@ NODE_LABELS = {
     "interpret": "Reading the brief",
     "research": "Researching the brand and market",
     "strategize": "Planning the search",
-    "discover": "Searching YouTube",
-    "enrich": "Fetching channels and recent uploads",
+    "persona": "Profiling the buyer",
+    "discover": "Reading trending charts and searching YouTube",
+    "scout": "Scouting creators",
+    "screen": "Screening the pool",
+    "enrich": "Fetching channels, uploads and comments",
     "dossier": "Compressing candidate dossiers",
-    "relevance": "Judging content relevance",
-    "audience": "Estimating purchase intent",
+    "relevance": "Judging product and brand fit",
+    "audience": "Inferring each creator's audience",
     "safety": "Auditing brand safety",
     "sponsorship": "Analysing sponsorship signals",
     "cultural": "Researching cultural standing",
     "score": "Scoring and ranking",
+    "widen": "Widening the search one level up",
     "narrate": "Writing rationales",
     "audit": "Verifying every claim",
     "review": "Reviewing the shortlist",
@@ -143,34 +150,44 @@ async def _run(brief: str) -> AsyncIterator[str]:
         return
 
     run_id = uuid.uuid4().hex[:12]
+    # Every agent call in this search adds to this meter; past the per-search
+    # ceiling the remaining calls are routed to Flash-Lite.
+    budget.begin_run()
     final: dict = {"agent_failures": [], "notices": []}
-    done = 0
+    # Progress counts distinct steps: a widened second pass re-runs some
+    # steps, and the bar must not run past 100%.
+    seen_nodes: set[str] = set()
 
     try:
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
         async with AsyncSqliteSaver.from_conn_string(CHECKPOINT_DB) as saver:
             g = graph_mod.build_graph(yt_key, gem_key, checkpointer=saver)
+            config = {"configurable": {"thread_id": run_id}, "recursion_limit": 60}
             async for chunk in g.astream(
                 {"brief_raw": brief, "run_id": run_id,
                  "agent_failures": [], "notices": []},
-                config={"configurable": {"thread_id": run_id}},
+                config=config,
             ):
                 for node, update in chunk.items():
                     if node in NODE_LABELS:
-                        done += 1
+                        seen_nodes.add(node)
                         yield _sse("progress", {
                             "node": node,
                             "label": NODE_LABELS[node],
-                            "done": done,
+                            "done": min(len(seen_nodes), TOTAL_STEPS),
                             "total": TOTAL_STEPS,
+                            # The second, wider pass is under way.
+                            "widening": "widen" in seen_nodes
+                                        and "narrate" not in seen_nodes,
                         })
-                    if isinstance(update, dict):
-                        for k, v in update.items():
-                            if k in ("agent_failures", "notices"):
-                                final[k] = final.get(k, []) + list(v or [])
-                            else:
-                                final[k] = v
+                    if isinstance(update, dict) and update.get("fatal"):
+                        final["fatal"] = update["fatal"]
                 await asyncio.sleep(0)  # let the event loop flush the frame
+            # The graph's own final state, with its reducers applied: a
+            # widened pass ADDS judgments, so the last update of a key is not
+            # the whole story.
+            snap = await g.aget_state(config)
+            final = {**final, **dict(snap.values or {})}
     except Exception as e:
         yield _sse("error", {"message": f"{type(e).__name__}: {e}"})
         return
@@ -183,6 +200,23 @@ async def _run(brief: str) -> AsyncIterator[str]:
         return
 
     yield _sse("result", _shape(final))
+
+
+# Sites that say nothing about the brand or the market: YouTube itself and
+# search-engine plumbing.
+_NOISE_SOURCES = ("youtube.com", "youtu.be", "google.com", "vertexaisearch",
+                  "googleusercontent.com")
+
+
+def _clean_sources(sources: list[str] | None) -> list[str]:
+    """The websites the research read, deduped, minus the noise."""
+    out: list[str] = []
+    for s in sources or []:
+        d = str(s).strip().lower()
+        d = d.split("://", 1)[-1].split("/", 1)[0].removeprefix("www.")
+        if d and not any(n in d for n in _NOISE_SOURCES) and d not in out:
+            out.append(d)
+    return out
 
 
 def _shape(state: dict) -> dict:
@@ -206,9 +240,15 @@ def _shape(state: dict) -> dict:
             }
             for e in (state.get("excluded") or [])
         ],
-        "cultural_sources": state.get("cultural_sources") or [],
+        "cultural_sources": _clean_sources(state.get("cultural_sources")),
         "market": state.get("market") or {},
-        "market_sources": state.get("market_sources") or [],
+        "market_sources": _clean_sources(
+            (state.get("market_sources") or []) + (state.get("scout_sources") or [])),
+        "persona": {
+            k: (state.get("persona") or {}).get(k)
+            for k in ("brand_profile", "product_moments", "archetypes")
+            if (state.get("persona") or {}).get(k)
+        },
         "review": state.get("review") or {},
         "agent_failures": sorted(set(state.get("agent_failures") or [])),
         "notices": list(dict.fromkeys(state.get("notices") or [])),
@@ -222,8 +262,10 @@ async def search(req: SearchRequest):
     if _session_counts.get(sid, 0) >= SESSION_QUERY_CAP:
         raise HTTPException(429, "That is enough searches for this session.")
 
+    # Two global gates: YouTube's daily quota, and this month's Gemini budget.
     q = cache.quota_status()
-    if q["blocked"]:
+    spend = await budget.status()
+    if q["blocked"] or spend["blocked"]:
         raise HTTPException(
             503,
             "New searches are paused for now. Briefs you have already run "
@@ -231,6 +273,7 @@ async def search(req: SearchRequest):
         )
 
     _session_counts[sid] = _session_counts.get(sid, 0) + 1
+    await budget.start_run()
     return StreamingResponse(
         _run(req.brief),
         media_type="text/event-stream",
@@ -281,6 +324,11 @@ async def health():
         # False on serverless: each instance keeps its own quota ledger, so
         # the daily search stop under-counts across instances.
         "quota_ledger_reliable": cache.ledger_is_reliable(),
+        # False when the monthly spend total lives in serverless /tmp and so
+        # resets on cold start. Add Upstash Redis (KV_REST_API_*) to fix.
+        # Amounts are never exposed here; run `python budget.py` for those.
+        "budget_ledger_reliable": budget.ledger_is_reliable(),
+        "budget_configured": budget.monthly_cap_usd() is not None,
         "keys_configured": bool(
             os.environ.get("YOUTUBE_API_KEY") and os.environ.get("GEMINI_API_KEY")
         ),

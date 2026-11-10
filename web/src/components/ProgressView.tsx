@@ -4,7 +4,7 @@ import { PHASES, activePhase, percentDone } from "../lib/phases";
 
 export default function ProgressView({ p }: { p: Progress | null }) {
   const done = p?.done ?? 0;
-  const pctDone = percentDone(done, p?.total ?? 13);
+  const pctDone = percentDone(done, p?.total ?? 19);
   const active = activePhase(done);
 
   return (
@@ -21,7 +21,7 @@ export default function ProgressView({ p }: { p: Progress | null }) {
             <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-grape-500" />
           </span>
           <h3 className="font-display text-[1.1rem] font-bold">
-            {PHASES[active].label}…
+            {p?.widening ? "Widening the search to find more good matches" : PHASES[active].label}…
           </h3>
         </div>
 
@@ -43,7 +43,9 @@ export default function ProgressView({ p }: { p: Progress | null }) {
         </div>
 
         <p className="mt-4 text-[12.5px] leading-relaxed muted">
-          This usually takes about a minute. You can leave the tab open.
+          {p?.widening
+            ? "Fewer than 10 creators were a strong match, so we are also looking at broader, more popular creators whose viewers overlap your buyers. This adds about a minute."
+            : "This usually takes one to two minutes. You can leave the tab open."}
         </p>
       </div>
     </div>

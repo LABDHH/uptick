@@ -7,11 +7,16 @@ export interface Metrics {
   engagement_rate: number | null;
   view_per_sub: number | null;
   consistency: number | null;
-  sponsor_ratio: number;
+  momentum?: number | null;
+  sponsor_ratio: number | null;
+  sponsored_videos?: number;
+  declared_paid_videos?: number;
+  last_sponsored_days?: number | null;
   activity: number;
   paid_placement_hits: number;
   videos_surfaced: number;
   eligible_video_count: number;
+  format?: "long" | "shorts";
   last_upload_days: number | null;
   channel_age_days: number | null;
   likes_visible: boolean;
@@ -19,6 +24,7 @@ export interface Metrics {
 
 export interface BreakdownTerm {
   term: string;
+  group?: "relevance" | "quality";
   value: number;
   weight: number;
   contribution: number;
@@ -52,6 +58,23 @@ export interface AgentView {
   sponsor_evidence?: string;
 }
 
+export type FitLevel = "match" | "neutral" | "clash";
+
+export interface AudienceField {
+  similarity: number;
+  adjusted: number;
+}
+
+export interface RelevanceDetail {
+  audience_fields?: Record<string, AudienceField>;
+  audience_level?: "strong" | "good" | "partial" | "weak" | null;
+  audience_evidence?: string[];
+  product_fit?: "natural" | "plausible" | "forced" | "none" | null;
+  product_moments?: string[];
+  brand_fit?: { tone?: FitLevel; price_tier?: FitLevel; values?: FitLevel };
+  brand_evidence?: string;
+}
+
 export interface Video {
   title: string;
   video_id: string;
@@ -72,6 +95,12 @@ export interface Creator {
   confidence: Confidence;
   partial: boolean;
   trending: boolean;
+  trending_days?: number;
+  popularity_bonus?: number;
+  archetype?: string;
+  relevance_score?: number | null;
+  relevance_gate?: number;
+  relevance_detail?: RelevanceDetail;
   cultural_bonus?: number;
   cultural_reason?: string;
   cultural?: Cultural;
@@ -83,8 +112,19 @@ export interface Creator {
   headline?: string;
   rationale?: string;
   caveat?: string | null;
-  rationale_status?: "verified" | "withheld_unverified" | "withheld_unaudited" | "none";
+  rationale_status?: "verified" | "summary";
   unsupported_claims?: string[];
+  /** Supporting numbers, rounded for people, each with what it means. */
+  key_numbers?: KeyNumber[];
+  /** top: clear recommendation · limited_data: strong but few videos ·
+   *  broader: a wider, popular pick whose viewers overlap the buyer. */
+  tier?: "top" | "limited_data" | "broader";
+}
+
+export interface KeyNumber {
+  label: string;
+  value: string;
+  note?: string | null;
 }
 
 export interface Intent {
@@ -120,6 +160,23 @@ export interface Market {
   confidence?: "high" | "medium" | "low";
 }
 
+export interface Archetype {
+  name: string;
+  why_audience_matches?: string;
+  uses_product_words?: boolean;
+}
+
+export interface Persona {
+  brand_profile?: {
+    tone?: string;
+    price_tier?: string;
+    values?: string[];
+    avoid?: string[];
+  };
+  product_moments?: string[];
+  archetypes?: Archetype[];
+}
+
 export interface Results {
   intent: Intent;
   ranked: Creator[];
@@ -128,6 +185,7 @@ export interface Results {
   cultural_sources: string[];
   market?: Market;
   market_sources?: string[];
+  persona?: Persona;
   review?: Review;
   held_back?: { held_back: number; note: string };
   floor_note?: { below_floor?: boolean; note?: string };
@@ -141,4 +199,5 @@ export interface Progress {
   label: string;
   done: number;
   total: number;
+  widening?: boolean;
 }

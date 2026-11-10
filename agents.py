@@ -1,11 +1,14 @@
-"""The 8 Gemini agents: throttle, injection defenses, ID validation.
+"""The Gemini agents: model routing, injection defenses, ID validation.
 
 Two things in this module are non-negotiable (§11 "never cut"):
-  * the 5s throttle — 12 RPM against a 15 RPM ceiling, leaving headroom for
-    repair retries.
   * channel-ID validation — every agent response is reconciled against the
     input candidate set, and unknown IDs are dropped. This catches
     hallucination generally, not just malice.
+  * input sanitization and delimiting of everything YouTube-derived.
+
+The key is on a paid tier, so calls are not paced per minute. Spend is the
+limit instead: every response's cost is recorded in budget.py, and the API
+stops admitting searches when the month's budget runs low.
 """
 from __future__ import annotations
 
@@ -21,12 +24,86 @@ from typing import Any, Callable, Optional
 from google import genai
 from google.genai import types
 
+import budget
 import cache
+import explain
 import metrics
 import prompts
 import schemas
 
-MODEL = "gemini-3.5-flash-lite"
+# ---------------------------------------------------------------- models
+#
+# Two models. 3.8 Flash reasons better and costs ~5x more per token; Flash-Lite
+# is cheap and fast. 3.8 goes only where judgement is hard AND the agent makes
+# ONE call per search (so its cost stays small and fixed) AND the result shapes
+# everything downstream or is what the user reads. The batched Stage B judges
+# read ~18k tokens each, so on 3.8 they would double the cost of a search; they
+# stay on Lite. If the budget grows, relevance_judge and audience_analyst are
+# the first to move up.
+FLASH = os.environ.get("UPTICK_MODEL_FLASH", "gemini-3.8-flash")
+LITE = os.environ.get("UPTICK_MODEL_LITE", "gemini-3.5-flash-lite")
+
+# agent name -> (model, thinking level). Thinking tokens bill as output, so
+# the level is set per agent rather than left at the model default.
+#
+# Temperature: Google advises leaving Gemini 3 thinking models at their
+# default (1.0); lower values can cause looping. 3.8 calls therefore ignore the
+# per-agent temp. Lite keeps the low temps it has been tuned and tested with.
+AGENT_MODELS: dict[str, tuple[str, str]] = {
+    # Stage A: one call each, but everything downstream inherits them.
+    "brief_interpreter": (LITE, "low"),       # extraction; fields re-validated
+    "market_search": (FLASH, "medium"),       # grounded: discovery's weak link
+    "market_researcher": (LITE, "minimal"),   # structures the briefing to JSON
+    "query_strategist": (LITE, "low"),        # category id re-validated
+    # Stage B: batched over the candidate set.
+    # Discovery: who to look for and where. Per-search cost matters at a $1
+    # monthly budget, so these are one call each (the scout is one grounded
+    # call for every archetype together) and stay on Lite.
+    "persona_builder": (LITE, "medium"),      # buyer + archetypes; shapes all discovery
+    "creator_scout": (LITE, "low"),           # grounded: finds creators per archetype
+    "scout_structurer": (LITE, "minimal"),    # copies names and links to JSON
+    "prescreener": (LITE, "low"),             # fast keep/drop over a big pool
+    "relevance_judge": (LITE, "low"),         # product + brand fit, quoted evidence
+    "audience_analyst": (LITE, "low"),        # audience profile from comments
+    "safety_auditor": (LITE, "low"),
+    "sponsorship_analyst": (LITE, "minimal"), # mostly reads paid_placement_hits
+    "cultural_search": (LITE, "low"),         # grounded; 12 creators, context only
+    "cultural_analyst": (LITE, "minimal"),    # structures the briefing to JSON
+    # Stage C: what the user reads.
+    "rationale_writer": (FLASH, "low"),       # prose; auditor checks the numbers
+    "output_auditor": (LITE, "medium"),       # mechanical, but minimal waves errors through
+    "shortlist_reviewer": (FLASH, "medium"),  # judges the whole list
+}
+_DEFAULT_ROUTE = (LITE, "low")
+
+
+def route(agent_name: str) -> tuple[str, str]:
+    model, level = AGENT_MODELS.get(agent_name, _DEFAULT_ROUTE)
+    # Per-search ceiling: past it, the rest of this search runs on Lite.
+    if model != LITE and budget.over_run_ceiling():
+        return LITE, level
+    return model, level
+
+
+def _thinking(level: str) -> types.ThinkingConfig:
+    return types.ThinkingConfig(thinking_level=types.ThinkingLevel(level.upper()))
+
+
+def _transient(e: Exception) -> bool:
+    """Overload, rate limit or a 5xx: worth retrying, and worth falling back
+    from 3.8 to Lite for. A bad reply or a 4xx about the request is not."""
+    if isinstance(e, (AgentFailure, ValueError)):  # incl. truncation, bad JSON
+        return False
+    code = getattr(e, "code", None) or getattr(e, "status_code", None)
+    if isinstance(code, int):
+        return code == 429 or code >= 500
+    return bool(_TRANSIENT_RE.search(str(e)))
+
+
+_TRANSIENT_RE = re.compile(
+    r"\b(429|50[0234])\b|RESOURCE_EXHAUSTED|UNAVAILABLE|DEADLINE_EXCEEDED|overloaded"
+)
+
 
 # The six-field agents (safety, sponsorship) emit the most tokens per
 # candidate. At 25 candidates an 8k ceiling truncates them mid-JSON, which is
@@ -34,15 +111,12 @@ MODEL = "gemini-3.5-flash-lite"
 MAX_OUTPUT_TOKENS = 32768
 
 # Candidates per Stage B request. Splitting a large set costs an extra call
-# (and 5s of throttle) but keeps every response well inside the ceiling.
+# but keeps every response well inside the ceiling.
 # Measured: a full dossier runs ~770 tokens/candidate of INPUT, and the
-# six-field agents emit ~120 tokens/candidate of OUTPUT. Eight keeps both
+# six-field agents emit ~120 tokens/candidate of OUTPUT. Twelve keeps both
 # sides comfortable while still judging enough candidates together for the
 # relative comparison to mean something.
 STAGE_B_BATCH = int(os.environ.get("UPTICK_BATCH", "12"))
-
-# 5s => 12 RPM, under the 15 RPM ceiling with room for a repair retry.
-THROTTLE_SECONDS = 5.0
 
 # Rate limiting: a sliding window, not a fixed sleep between calls.
 #
@@ -51,7 +125,11 @@ THROTTLE_SECONDS = 5.0
 # limit allows fifteen per minute. A window lets calls that fit in the budget
 # run concurrently and only blocks when the minute is genuinely full, which is
 # what the limit actually says.
-GEMINI_RPM = int(os.environ.get("UPTICK_GEMINI_RPM", "15"))
+#
+# OFF by default: the key is on a paid tier, where the per-minute limit is far
+# above what one search sends. Set UPTICK_GEMINI_RPM to turn it back on (e.g.
+# 15 for a free-tier key).
+GEMINI_RPM = int(os.environ.get("UPTICK_GEMINI_RPM", "0"))
 # Leave one slot spare so a repair retry never tips us over the limit.
 _WINDOW = 60.0
 _SAFETY = 1
@@ -83,6 +161,8 @@ async def throttle() -> None:
     Concurrent callers each take a slot, so agents that fan out in the graph
     genuinely overlap instead of queueing behind a fixed sleep.
     """
+    if GEMINI_RPM <= 0:
+        return
     while True:
         async with _loop_lock():
             key = _loop_key()
@@ -194,7 +274,9 @@ class GeminiClient:
 
         started = time.monotonic()
         try:
-            result = await self._generate(system, payload, schema, temp)
+            result = await self._generate(
+                system, payload, schema, temp, agent=agent_name
+            )
         except OutputTruncated:
             # Never retry this verbatim — the same request truncates again.
             # The caller (call_batched) splits the candidate set instead.
@@ -204,7 +286,7 @@ class GeminiClient:
             )
             raise
         except (json.JSONDecodeError, AgentFailure) as first:
-            # One repair retry. It costs RPD, so exactly one.
+            # One repair retry. It costs money, so exactly one.
             try:
                 result = await self._generate(
                     system,
@@ -214,6 +296,7 @@ class GeminiClient:
                       "markdown fence, no commentary.",
                     schema,
                     temp,
+                    agent=agent_name,
                 )
             except Exception as e:
                 cache.log_agent(
@@ -238,14 +321,52 @@ class GeminiClient:
             cache.put_agent(cache_key, agent_name, result)
         return result
 
-    async def _generate(self, system: str, payload: str, schema: dict, temp: float) -> dict:
+    async def _generate(
+        self, system: str, payload: str, schema: dict, temp: float,
+        agent: str = "",
+    ) -> dict:
+        """Route to the agent's model; retry transient errors; and if 3.8 is
+        still overloaded or out of quota, answer on Lite rather than fail."""
+        model, level = route(agent)
+        tried: list[str] = []
+        for m in ([model, LITE] if model != LITE else [model]):
+            try:
+                return await self._generate_on(m, level, system, payload, schema, temp)
+            except Exception as e:
+                tried.append(f"{m}: {type(e).__name__}: {str(e)[:120]}")
+                if not _transient(e) or m == LITE:
+                    raise
+        raise AgentFailure("; ".join(tried))  # unreachable, kept for type checkers
+
+    async def _generate_on(
+        self, model: str, level: str, system: str, payload: str,
+        schema: dict, temp: float, attempts: int = 3,
+    ) -> dict:
+        """One model, with backoff on transient errors (1s, 2s)."""
+        for attempt in range(attempts):
+            try:
+                return await self._generate_once(
+                    model, level, system, payload, schema, temp
+                )
+            except Exception as e:
+                if not _transient(e) or attempt == attempts - 1:
+                    raise
+                await asyncio.sleep(2 ** attempt)
+        raise AssertionError("unreachable")
+
+    async def _generate_once(
+        self, model: str, level: str, system: str, payload: str,
+        schema: dict, temp: float,
+    ) -> dict:
         await throttle()
         resp = await self.client.aio.models.generate_content(
-            model=MODEL,
+            model=model,
             contents=payload,
             config=types.GenerateContentConfig(
                 system_instruction=system,
-                temperature=temp,
+                # 3.8 runs at its default temperature; see AGENT_MODELS.
+                temperature=None if model == FLASH else temp,
+                thinking_config=_thinking(level),
                 response_mime_type="application/json",
                 response_schema=schema,
                 max_output_tokens=MAX_OUTPUT_TOKENS,
@@ -255,6 +376,8 @@ class GeminiClient:
                 ),
             ),
         )
+        # Paid for whether or not it parses, so record it first.
+        await budget.record(budget.cost_of_response(model, resp))
 
         # A truncated response is the failure mode that matters here: the
         # six-field agents emit the most tokens per candidate, so they hit the
@@ -288,7 +411,7 @@ class GeminiClient:
 
     async def search_grounded(
         self, system: str, payload: str, temp: float,
-        attempts: int = 3,
+        attempts: int = 3, agent: str = "",
     ) -> tuple[str, list[str]]:
         """A grounded call: Google Search enabled, free-text out.
 
@@ -296,16 +419,21 @@ class GeminiClient:
         this returns prose and a separate structuring pass turns it into JSON.
         Returns (text, source_urls).
 
-        Retried with backoff, unlike the schema path. Grounded calls reach out
-        to Search and are markedly flakier than a plain generate: a single 503
-        used to take out the market researcher and the cultural analyst
-        together, which is the pair most likely to fail in the same run and the
+        Retried with backoff. Grounded calls reach out to Search and are
+        markedly flakier than a plain generate: a single 503 used to take out
+        the market researcher and the cultural analyst together, which is the
         pair whose absence the user actually sees ("these agents failed").
+        The last attempt runs on Lite when the agent is routed to 3.8, so an
+        overloaded 3.8 degrades the research instead of losing it.
         """
+        model, level = route(agent)
         last: Exception | None = None
         for attempt in range(attempts):
+            m = LITE if (attempt == attempts - 1 and attempt > 0) else model
             try:
-                return await self._search_grounded_once(system, payload, temp)
+                return await self._search_grounded_once(
+                    system, payload, temp, model=m, level=level
+                )
             except Exception as e:
                 last = e
                 if attempt < attempts - 1:
@@ -318,21 +446,27 @@ class GeminiClient:
         ) from last
 
     async def _search_grounded_once(
-        self, system: str, payload: str, temp: float
+        self, system: str, payload: str, temp: float,
+        model: str = "", level: str = "low",
     ) -> tuple[str, list[str]]:
+        model = model or LITE
         await throttle()
         resp = await self.client.aio.models.generate_content(
-            model=MODEL,
+            model=model,
             contents=payload,
             config=types.GenerateContentConfig(
                 system_instruction=system,
-                temperature=temp,
+                temperature=None if model == FLASH else temp,
+                thinking_config=_thinking(level),
                 max_output_tokens=MAX_OUTPUT_TOKENS,
                 tools=[types.Tool(google_search=types.GoogleSearch())],
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(
                     disable=True
                 ),
             ),
+        )
+        await budget.record(
+            budget.cost_of_response(model, resp), budget.grounded_queries(resp)
         )
         text = (resp.text or "").strip()
         if not text:
@@ -367,7 +501,7 @@ def dossier_hash(dossier: dict) -> str:
     """Key agent cache on the candidate set, not the brief.
 
     Two differently worded briefs that surface the same creators should hit
-    cache — at 500 RPD that matters more than YouTube caching does.
+    cache — every hit is a search the monthly budget does not pay for.
     """
     return hashlib.sha256(
         json.dumps(dossier, sort_keys=True, default=str).encode()
@@ -509,7 +643,9 @@ FIELD_LEGEND = (
     "median_views, engagement_rate, paid_placement_hits (videos YouTube "
     "confirmed as creator-declared paid promotions), and videos[] where "
     "t=title, d=description, views, likes, age_d=days since upload, "
-    "paid=came from the paid-promotion search."
+    "paid=came from the paid-promotion search. When present: comments "
+    "(a sample of viewer comments), tags, topics, keywords (the creator's "
+    "own) and audio_lang."
 )
 
 
@@ -561,28 +697,86 @@ def _stage_b_payload(dossier: dict, intent: dict, extra: str = "") -> str:
     )
 
 
+_LEVELS = {
+    "product_fit": ("natural", "plausible", "forced", "none"),
+    "brand": ("match", "neutral", "clash"),
+    "buyer_overlap": ("strong", "good", "partial", "weak"),
+    "match_type": ("direct", "adjacent", "lifestyle", "weak"),
+}
+
+
+def _keyed(dhash: str, *parts: str) -> str:
+    """Relevance depends on the brand as well as the creators, so its cache key
+    must too: the same creators judged for two brands are two judgments."""
+    if not dhash:
+        return ""
+    return hashlib.sha256("|".join((dhash, *parts)).encode()).hexdigest()[:32]
+
+
 async def agent3_relevance(
     g: GeminiClient, dossier: dict, intent: dict, dhash: str,
-    market: dict | None = None,
+    market: dict | None = None, persona_ctx: str = "",
 ) -> dict[str, dict]:
-    ctx = market_context(market)
-    return await call_batched(
+    """Product fit and brand fit, as rubric levels with quoted evidence.
+
+    persona_ctx is the brand profile, product moments and archetypes rendered
+    by relevance.persona_context(). Code turns the levels into numbers.
+    """
+    ctx = market_context(market) + persona_ctx
+    rows = await call_batched(
         g, "relevance_judge", prompts.RELEVANCE_JUDGE, schemas.RELEVANCE, 0.2,
-        dossier, lambda sub: _stage_b_payload(sub, intent, ctx), dhash,
-        ("relevance",),
+        dossier, lambda sub: _stage_b_payload(sub, intent, ctx),
+        _keyed(dhash, persona_ctx, json.dumps(intent, sort_keys=True, default=str)),
     )
+    for r in rows.values():
+        if r.get("product_fit") not in _LEVELS["product_fit"]:
+            r.pop("product_fit", None)
+        r["product_moments"] = [clean_text(t, 120) for t in
+                                (r.get("product_moments") or [])[:3] if t]
+        bf = r.get("brand_fit") if isinstance(r.get("brand_fit"), dict) else {}
+        r["brand_fit"] = {k: bf.get(k) for k in ("tone", "price_tier", "values")
+                          if bf.get(k) in _LEVELS["brand"]}
+        r["brand_evidence"] = clean_text(r.get("brand_evidence"), 240)
+        r["archetype"] = clean_text(r.get("archetype"), 80)
+        r["reason"] = clean_text(r.get("reason"), 400)
+        if r.get("match_type") not in _LEVELS["match_type"]:
+            r["match_type"] = "adjacent"
+    return rows
 
 
 async def agent4_audience(
     g: GeminiClient, dossier: dict, intent: dict, dhash: str,
-    market: dict | None = None,
+    market: dict | None = None, persona_ctx: str = "",
+    evidence: dict[str, dict] | None = None,
 ) -> dict[str, dict]:
-    ctx = market_context(market)
-    return await call_batched(
+    """Who watches each creator, in the same profile shape as the target buyer.
+
+    evidence adds what only this agent needs (viewer comments, tags, topics,
+    audio language), so the other Stage B agents do not pay for reading it.
+    """
+    evidence = evidence or {}
+    ctx = market_context(market) + persona_ctx + prompts._PROFILE_RULES + "\n\n"
+
+    def build(sub: dict) -> str:
+        merged = {k: {**v, **evidence.get(k, {})} for k, v in sub.items()}
+        return _stage_b_payload(merged, intent, ctx)
+
+    rows = await call_batched(
         g, "audience_analyst", prompts.AUDIENCE_ANALYST, schemas.AUDIENCE, 0.3,
-        dossier, lambda sub: _stage_b_payload(sub, intent, ctx), dhash,
-        ("audience_fit",),
+        dossier, build,
+        _keyed(dhash, persona_ctx, json.dumps(evidence, sort_keys=True, default=str)),
     )
+    for r in rows.values():
+        if r.get("buyer_overlap") not in _LEVELS["buyer_overlap"]:
+            r.pop("buyer_overlap", None)
+        if not isinstance(r.get("profile"), dict):
+            r.pop("profile", None)
+        r["evidence"] = [clean_text(e, 160) for e in (r.get("evidence") or [])[:4] if e]
+        r["inferred_viewer_profile"] = clean_text(r.get("inferred_viewer_profile"), 240)
+        r["reasoning"] = clean_text(r.get("reasoning"), 300)
+        if r.get("purchase_intent_signal") not in ("high", "medium", "low"):
+            r["purchase_intent_signal"] = "medium"
+    return rows
 
 
 async def agent5_safety(
@@ -634,82 +828,54 @@ async def agent6_sponsorship(
 async def agent7_narrate(
     g: GeminiClient, top: list[dict], intent: dict
 ) -> dict[str, dict]:
-    """Top 15 only — no prose spent on candidates that got cut."""
-    brief_rows = [
-        {
-            "channel_id": c["channel_id"],
-            "title": c["title"],
-            "fit_score": c["fit_score"],
-            "confidence": c["confidence"],
-            "subscribers": c["metrics"].get("subscriber_count"),
-            "median_views": c["metrics"].get("median_views"),
-            "engagement_rate": c["metrics"].get("engagement_rate"),
-            "view_per_sub": c["metrics"].get("view_per_sub"),
-            "consistency": c["metrics"].get("consistency"),
-            "sponsor_ratio": c["metrics"].get("sponsor_ratio"),
-            "relevance": c["agent"].get("relevance"),
-            "audience_fit": c["agent"].get("audience_fit"),
-            "sponsor_confidence": c["agent"].get("sponsor_confidence"),
-            "observed_format": c["agent"].get("observed_format"),
-            "sponsor_evidence": c["agent"].get("sponsor_evidence"),
-            "relevance_reason": c["agent"].get("relevance_reason"),
-            "safety_flag": c["agent"].get("safety_category"),
-        }
-        for c in top
-    ]
+    """The shortlist only: no prose spent on candidates that got cut.
+
+    The writer reads explain.facts, where every number is already in the form
+    a marketer reads ("1.4M", "~600K per video", "1.3%"), never a raw float.
+    """
+    rows = [explain.facts(c, i + 1, len(top)) for i, c in enumerate(top)]
+    brief = {k: intent.get(k) for k in ("brand", "product", "target_audience",
+                                        "geo_raw", "size_band") if intent.get(k)}
     payload = (
-        f"Advertiser intent:\n{json.dumps(intent, indent=2)}\n\n"
-        f"Top creators with their computed metrics:\n"
-        + wrap(json.dumps(brief_rows, indent=1))
-        + "\n\nWrite one entry per channel_id. Cite only these numbers."
+        f"The brand's brief:\n{json.dumps(brief, indent=1)}\n\n"
+        f"The shortlist, best first, with the facts you may use:\n"
+        + wrap(json.dumps(rows, indent=1, ensure_ascii=False))
+        + "\n\nWrite one entry per channel_id."
     )
     out = await g.call("rationale_writer", prompts.RATIONALE_WRITER,
-                       payload, schemas.RATIONALE, 0.6)
-    rows = reconcile(out.get("results"), {c["channel_id"] for c in top})
-    for r in rows.values():
+                       payload, schemas.RATIONALE, 0.5)
+    rows_out = reconcile(out.get("results"), {c["channel_id"] for c in top})
+    for r in rows_out.values():
         r["headline"] = clean_text(r.get("headline"), 120)
-        r["rationale"] = clean_text(r.get("rationale"), 600)
+        r["rationale"] = clean_text(r.get("rationale"), 700)
         cav = r.get("caveat")
         r["caveat"] = clean_text(cav, 300) if cav else None
-    return rows
+    return rows_out
 
 
 async def agent8_audit(
     g: GeminiClient, top: list[dict], rationales: dict[str, dict]
 ) -> dict[str, dict]:
+    """Check each rationale against the SAME facts the writer was given."""
     rows = []
-    for c in top:
+    for i, c in enumerate(top):
         r = rationales.get(c["channel_id"])
         if not r:
             continue
-        rows.append(
-            {
-                "channel_id": c["channel_id"],
-                "source_metrics": {
-                    "title": c["title"],
-                    "fit_score": c["fit_score"],
-                    "confidence": c["confidence"],
-                    "subscribers": c["metrics"].get("subscriber_count"),
-                    "median_views": c["metrics"].get("median_views"),
-                    "engagement_rate": c["metrics"].get("engagement_rate"),
-                    "view_per_sub": c["metrics"].get("view_per_sub"),
-                    "consistency": c["metrics"].get("consistency"),
-                    "sponsor_ratio": c["metrics"].get("sponsor_ratio"),
-                    "sponsor_confidence": c["agent"].get("sponsor_confidence"),
-                    "observed_format": c["agent"].get("observed_format"),
-                },
-                "written_rationale": {
-                    "headline": r.get("headline"),
-                    "rationale": r.get("rationale"),
-                    "caveat": r.get("caveat"),
-                },
-            }
-        )
+        rows.append({
+            "channel_id": c["channel_id"],
+            "facts": explain.facts(c, i + 1, len(top)),
+            "written_rationale": {
+                "headline": r.get("headline"),
+                "rationale": r.get("rationale"),
+                "caveat": r.get("caveat"),
+            },
+        })
     if not rows:
         return {}
     payload = (
-        "Verify each rationale against its own source_metrics:\n"
-        + wrap(json.dumps(rows, indent=1))
+        "Verify each written rationale against its own facts:\n"
+        + wrap(json.dumps(rows, indent=1, ensure_ascii=False))
         + "\n\nReturn a verdict for every channel_id."
     )
     out = await g.call("output_auditor", prompts.OUTPUT_AUDITOR,
@@ -724,7 +890,7 @@ async def agent8_audit(
 # ---------------------------------------------------------------- Agent 9
 
 # Researching every candidate costs one grounded call each, which is slow and
-# eats RPD. Only the candidates that could actually make the shortlist are
+# costs per Search query. Only the candidates that could actually make the shortlist are
 # worth researching.
 CULTURAL_SHORTLIST = 12
 
@@ -775,7 +941,8 @@ async def agent9_cultural(
     started = time.monotonic()
     try:
         briefing, sources = await g.search_grounded(
-            prompts.CULTURAL_RESEARCHER, research_payload, 0.4
+            prompts.CULTURAL_RESEARCHER, research_payload, 0.4,
+            agent="cultural_search",
         )
     except Exception as e:
         cache.log_agent(
@@ -845,7 +1012,8 @@ async def agent10_market_research(
     started = time.monotonic()
     try:
         briefing, sources = await g.search_grounded(
-            prompts.MARKET_RESEARCHER, payload, 0.35
+            prompts.MARKET_RESEARCHER, payload, 0.35,
+            agent="market_search",
         )
     except Exception as e:
         cache.log_agent(

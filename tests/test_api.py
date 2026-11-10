@@ -20,7 +20,6 @@ def stub(monkeypatch, tmp_path):
     tg = importlib.import_module("test_graph")
     monkeypatch.setattr(youtube, "YouTubeClient", tg.FakeYT)
     monkeypatch.setattr(agents, "GeminiClient", tg.FakeGemini)
-    monkeypatch.setattr(agents, "THROTTLE_SECONDS", 0.0)
     monkeypatch.setattr(cache, "DB_PATH", str(tmp_path / "api.db"))
     monkeypatch.setenv("YOUTUBE_API_KEY", "k")
     monkeypatch.setenv("GEMINI_API_KEY", "k")

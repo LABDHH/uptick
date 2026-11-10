@@ -18,7 +18,6 @@ import schemas
 @pytest.fixture(autouse=True)
 def fast_throttle(monkeypatch, tmp_path):
     import cache
-    monkeypatch.setattr(agents, "THROTTLE_SECONDS", 0.0)
     monkeypatch.setattr(cache, "DB_PATH", str(tmp_path / "t.db"))
     cache._local.__dict__.pop("conn", None)
     cache.init_db()
@@ -39,7 +38,7 @@ class Client(agents.GeminiClient):
         self.limit = limit
         self.calls = []
 
-    async def _generate(self, system, payload, schema, temp):
+    async def _generate(self, system, payload, schema, temp, **kw):
         n = payload.count('"channel_id"')
         self.calls.append(n)
         if n > self.limit:
@@ -85,7 +84,7 @@ async def test_truncation_is_never_retried_verbatim():
             self.client = None
             self.n = 0
 
-        async def _generate(self, system, payload, schema, temp):
+        async def _generate(self, system, payload, schema, temp, **kw):
             self.n += 1
             raise agents.OutputTruncated("ceiling")
 
@@ -105,7 +104,7 @@ async def test_a_transient_failure_is_repaired_not_lost():
             self.client = None
             self.seen = 0
 
-        async def _generate(self, system, payload, schema, temp):
+        async def _generate(self, system, payload, schema, temp, **kw):
             self.seen += 1
             if self.seen == 1:
                 raise json.JSONDecodeError("bad", "", 0)
@@ -130,7 +129,7 @@ async def test_one_dead_batch_still_returns_the_others():
             self.client = None
             self.seen = 0
 
-        async def _generate(self, system, payload, schema, temp):
+        async def _generate(self, system, payload, schema, temp, **kw):
             self.seen += 1
             ids = [d["channel_id"] for d in json.loads(
                 payload.split("<candidate_data>")[1].split("</candidate_data>")[0])]
@@ -154,7 +153,7 @@ def test_output_ceiling_is_large_enough_for_a_full_set():
     assert agents.STAGE_B_BATCH >= 5
 
 
-def test_throttle_works_across_event_loops():
+def test_throttle_works_across_event_loops(monkeypatch):
     """Streamlit calls asyncio.run() per query, creating a new loop each time.
 
     A module-level asyncio.Lock binds to the first loop that awaits it, so
@@ -164,7 +163,8 @@ def test_throttle_works_across_event_loops():
     import asyncio as aio
     import concurrent.futures as cf
 
-    agents.THROTTLE_SECONDS = 0.0
+    # Off by default on a paid key; switch the window on so it is exercised.
+    monkeypatch.setattr(agents, "GEMINI_RPM", 15)
 
     async def work():
         await agents.throttle()

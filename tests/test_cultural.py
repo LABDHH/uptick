@@ -8,7 +8,6 @@ import metrics
 @pytest.fixture(autouse=True)
 def fast(monkeypatch, tmp_path):
     import cache
-    monkeypatch.setattr(agents, "THROTTLE_SECONDS", 0.0)
     monkeypatch.setattr(cache, "DB_PATH", str(tmp_path / "c.db"))
     cache._local.__dict__.pop("conn", None)
     cache.init_db()
@@ -25,7 +24,7 @@ class FakeCultural(agents.GeminiClient):
         self.fail_search = fail_search
         self.searched = 0
 
-    async def search_grounded(self, system, payload, temp):
+    async def search_grounded(self, system, payload, temp, **kw):
         self.searched += 1
         if self.fail_search:
             raise RuntimeError("search unavailable")

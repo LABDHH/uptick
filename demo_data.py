@@ -1,7 +1,7 @@
 """Fixture results for demo mode.
 
 Lets the full UI render, ranked rows, breakdowns, evidence, banners, the
-withheld-rationale and safety paths, without an API key, a network call, or a
+code-written summary and safety paths, without an API key, a network call, or a
 single unit of YouTube quota. The numbers are synthetic but internally
 consistent: they are run through the real metrics.score_candidates(), so the
 scores and renormalization on screen are genuinely computed, not hard-coded.
@@ -116,6 +116,63 @@ RATIONALE = {
 }
 
 
+# The buyer the demo brief is aimed at, in the same shape the persona agent
+# produces, so the audience match on screen is computed exactly as in a run.
+PERSONA = {
+    "brand_profile": {"tone": "playful", "price_tier": "mass",
+                      "values": ["honest labels", "everyday energy"],
+                      "avoid": ["unproven health claims", "steroids"],
+                      "languages": ["hi", "en"]},
+    "product_moments": ["between back-to-back lectures", "post-workout",
+                        "late-night study sessions", "the commute to a first job"],
+    "target_audience": {
+        "age_bands": [{"band": "18_24", "weight": 0.7}, {"band": "25_34", "weight": 0.3}],
+        "life_stages": ["college", "early_career"],
+        "interests": ["comedy", "college_campus", "fitness_gym", "lifestyle_vlogs"],
+        "languages": ["hi", "en"], "region": "IN", "spending_power": "mid",
+        "confidence": {"age_bands": "high", "life_stages": "high", "interests": "medium",
+                       "languages": "high", "region": "high", "spending_power": "medium"},
+    },
+    "archetypes": [
+        {"name": "Campus and comedy creators",
+         "why_audience_matches": "Their viewers are students and young workers who "
+                                 "snack between classes and shifts.",
+         "uses_product_words": False},
+        {"name": "Everyday fitness creators",
+         "why_audience_matches": "Gym-goers on a student budget who already buy protein.",
+         "uses_product_words": True},
+        {"name": "Nutrition explainers",
+         "why_audience_matches": "Label-readers who compare products before buying.",
+         "uses_product_words": True},
+        {"name": "Wellness and yoga",
+         "why_audience_matches": "Health-minded, but older and less snack-driven.",
+         "uses_product_words": False},
+    ],
+}
+
+COMEDY = {"Aditi Does Standup", "Hostel Diaries"}
+EXPLAINERS = {"The Nutrition Desk", "Strength & Science", "The Macro Method",
+              "Supplement Truth"}
+WELLNESS = {"Yoga Every Morning", "Mumbai Runs"}
+
+
+def _archetype(title: str) -> str:
+    if title in COMEDY:
+        return "Campus and comedy creators"
+    if title in EXPLAINERS:
+        return "Nutrition explainers"
+    if title in WELLNESS:
+        return "Wellness and yoga"
+    return "Everyday fitness creators"
+
+
+def _level(x: float, cuts: list[tuple[float, str]], last: str) -> str:
+    for cut, name in cuts:
+        if x >= cut:
+            return name
+    return last
+
+
 def _ts(days: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat().replace("+00:00", "Z")
 
@@ -184,14 +241,62 @@ def build() -> dict:
             ],
         })
 
-        relevance[cid] = {"channel_id": cid, "relevance": rel,
-                          "match_type": "direct" if rel > 0.75 else "adjacent",
-                          "reason": f'Reviews supplements directly in "{vids[0]["snippet"]["title"]}".'}
-        audience[cid] = {"channel_id": cid, "audience_fit": aud,
-                         "inferred_viewer_profile":
-                             "Lifters buying their own supplements, mostly Hindi and English speakers",
-                         "purchase_intent_signal": "high" if aud > 0.75 else "medium",
-                         "reasoning": "Content is purchase-adjacent: comparisons and reviews."}
+        arc = _archetype(title)
+        comedic = title in COMEDY
+        relevance[cid] = {
+            "channel_id": cid,
+            "product_fit": _level(rel, [(0.8, "natural"), (0.66, "plausible"),
+                                        (0.5, "forced")], "none")
+            if not comedic else "natural",
+            # The fixture's creators share five synthetic titles; pick a
+            # different one per creator so the demo does not repeat itself.
+            "product_moments": ([vids[sum(map(ord, title)) % min(5, len(vids))]["snippet"]["title"]]
+                                if rel >= 0.5 or comedic else []),
+            "brand_fit": {
+                "tone": "match" if comedic or rel > 0.8 else "neutral",
+                "price_tier": "match" if subs < 2_000_000 else "neutral",
+                "values": "clash" if flag else "match",
+            },
+            "brand_evidence": ("Light, self-deprecating humour about student life."
+                               if comedic else
+                               f"Straight-talking, budget-aware {arc.lower()} content."),
+            "archetype": arc,
+            "match_type": "lifestyle" if comedic else (
+                "direct" if rel > 0.75 else "adjacent"),
+            "reason": f'"{vids[0]["snippet"]["title"]}" draws viewers who buy their own snacks.',
+        }
+        young = aud >= 0.75
+        audience[cid] = {
+            "channel_id": cid,
+            "profile": {
+                "age_bands": ([{"band": "18_24", "weight": 0.65}, {"band": "25_34", "weight": 0.35}]
+                              if young else
+                              [{"band": "25_34", "weight": 0.5}, {"band": "35_44", "weight": 0.5}]),
+                "life_stages": (["college", "early_career"] if comedic else
+                                ["early_career"] if young else ["established_professional"]),
+                "interests": (["comedy", "college_campus", "lifestyle_vlogs"] if comedic else
+                              ["fitness_gym", "nutrition_diet"] if arc != "Wellness and yoga"
+                              else ["health_wellness", "spirituality"]),
+                "languages": ["hi", "en"], "region": "IN",
+                "spending_power": "mid",
+                "confidence": {"age_bands": "medium", "life_stages": "medium",
+                               "interests": "high", "languages": "high",
+                               "region": "high", "spending_power": "low"},
+            },
+            "buyer_overlap": _level(aud, [(0.88, "strong"), (0.75, "good"),
+                                          (0.55, "partial")], "weak"),
+            "evidence": (["\"watching this between lectures again\"",
+                          "\"hostel wifi finally worked for this one\""]
+                         if comedic else
+                         ["\"which whey is best for a student budget?\"",
+                          "\"day 40 of following your plan\""]),
+            "inferred_viewer_profile": (
+                "Likely 18-24 students and young workers, Hindi and English "
+                "speaking (inferred from comments)" if young else
+                "Likely late-20s to 40s professionals (inferred from comments)"),
+            "purchase_intent_signal": "high" if aud > 0.75 else "medium",
+            "reasoning": "Comments mention classes, budgets and gym routines.",
+        }
         sponsorship[cid] = {
             "channel_id": cid,
             "sponsor_confidence": min(1.0, 0.25 + paid * 0.24),
@@ -216,14 +321,18 @@ def build() -> dict:
         if row:
             cultural[f"UCdemo{idx:018d}"] = dict(row, channel_id=f"UCdemo{idx:018d}")
 
-    trending = {candidates[2]["channel_id"]}
+    trending = {candidates[2]["channel_id"], candidates[1]["channel_id"]}
+    trending_days = {candidates[2]["channel_id"]: 6, candidates[1]["channel_id"]: 2}
+    for c in candidates:
+        c["archetype"] = _archetype(c["channel"]["snippet"]["title"])
     ranked, review, excluded = metrics.score_candidates(
         candidates, relevance, audience, safety, sponsorship, trending, "mid",
-        set(), cultural=cultural, target_generation="gen_z",
+        set(), cultural=cultural, target_generation="gen_z", region_code="IN",
+        target_audience=PERSONA["target_audience"], trending_days=trending_days,
     )
 
     # Rationales for the top few; one deliberately fails the audit so the
-    # withheld-prose path is visible.
+    # code-written summary path is visible.
     rationales, audit = {}, {}
     for row in ranked[:6]:
         entry = RATIONALE.get(row["title"])
@@ -235,10 +344,10 @@ def build() -> dict:
                            "rationale": body, "caveat": cav}
         audit[cid] = {"channel_id": cid, "verdict": "pass", "unsupported_claims": []}
 
-    # One deliberately unverifiable rationale, so the withheld-prose path is
-    # visible in the demo: it claims demographics, which no data can support.
+    # One deliberately unverifiable rationale, so the code-written summary
+    # path is visible in the demo: it claims demographics no data supports.
     for row in ranked:
-        if row["title"] == "Gym Kit Reviews":
+        if row["title"] == "Budget Fitness Bharat":
             cid = row["channel_id"]
             rationales[cid] = {
                 "channel_id": cid,
@@ -271,6 +380,7 @@ def build() -> dict:
                                            "best whey protein", "protein for muscle gain"],
                        "relevance_language": "hi", "region_code": "IN",
                        "excluded_terms": ["recipe"]},
+        "persona": PERSONA,
         "scored": ranked, "review_manually": review, "excluded": excluded,
         "cultural": cultural,
         "cultural_sources": ["scroll.in", "thehindu.com", "filmcompanion.in",

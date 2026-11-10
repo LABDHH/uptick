@@ -5,7 +5,7 @@
     "api/index.py": {
       "maxDuration": 300,
       "memory": 1024,
-      "includeFiles": "{agents.py,cache.py,demo_data.py,graph.py,metrics.py,prompts.py,schemas.py,youtube.py,web/dist/**}",
+      "includeFiles": "{agents.py,budget.py,cache.py,demo_data.py,discovery.py,explain.py,graph.py,metrics.py,prompts.py,relevance.py,schemas.py,youtube.py,web/dist/**}",
       "excludeFiles": "{tests/**,web/node_modules/**,web/src/**,.venv/**,**/*.db,**/*.db-shm,**/*.db-wal,streamlit_version_archive.zip}"
     }
   },

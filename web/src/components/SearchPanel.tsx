@@ -40,10 +40,10 @@ const EXAMPLES = [
 ];
 
 export default function SearchPanel({
-  brief, setBrief, onSearch, onDemo, busy, compact: isCompact,
+  brief, setBrief, onSearch, busy, compact: isCompact,
 }: {
   brief: string; setBrief: (s: string) => void;
-  onSearch: () => void; onDemo: () => void; busy: boolean; compact?: boolean;
+  onSearch: () => void; busy: boolean; compact?: boolean;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const [copied, setCopied] = useState(false);
@@ -113,11 +113,6 @@ export default function SearchPanel({
         <div className="mb-2.5 flex items-center gap-2">
           <span className="label">Or start from an example</span>
           <span className="h-px flex-1 bg-line dark:bg-white/10" />
-          <button onClick={onDemo} disabled={busy}
-                  className="text-[12.5px] font-semibold text-grape-600 transition
-                             hover:underline disabled:opacity-50 dark:text-grape-300">
-            Preview sample results →
-          </button>
         </div>
 
         <div className="grid gap-2 sm:grid-cols-3">

@@ -84,19 +84,73 @@ QUERY_PLAN = {
                  "region_code", "excluded_terms"],
 }
 
+# ---------------------------------------------------------------- audience profile
+#
+# One shape for both sides of the audience match: the target buyer (persona
+# agent) and each creator's inferred audience (Agent 4). metrics.audience_match
+# compares them field by field, so the shapes must stay identical.
+
+def _enum(values: list[str]) -> dict:
+    return {"type": "string", "enum": list(values)}
+
+
+_CONF = _enum(["high", "medium", "low"])
+
+
+def _profile() -> dict:
+    from prompts import AGE_BANDS, INTEREST_TAXONOMY, LIFE_STAGES
+    return {
+        "type": "object",
+        "properties": {
+            "age_bands": _arr({
+                "type": "object",
+                "properties": {"band": _enum(AGE_BANDS), "weight": NUM},
+                "required": ["band", "weight"],
+            }),
+            "life_stages": _arr(_enum(LIFE_STAGES)),
+            "interests": _arr(_enum(INTEREST_TAXONOMY)),
+            "languages": _arr(STR),
+            "region": STR,
+            "spending_power": _enum(["low", "mid", "high", "unknown"]),
+            "confidence": {
+                "type": "object",
+                "properties": {k: _CONF for k in (
+                    "age_bands", "life_stages", "interests", "languages",
+                    "region", "spending_power")},
+                "required": ["age_bands", "life_stages", "interests",
+                             "languages", "region", "spending_power"],
+            },
+        },
+        "required": ["age_bands", "life_stages", "interests", "languages",
+                     "region", "spending_power", "confidence"],
+    }
+
+
+AUDIENCE_PROFILE = _profile()
+
 # ---------------------------------------------------------------- Agent 3
 
 RELEVANCE = _results(
     {
         "channel_id": STR,
-        "relevance": NUM,
-        "reason": STR,
-        "match_type": {
-            "type": "string",
-            "enum": ["direct", "adjacent", "lifestyle", "weak"],
+        "product_fit": _enum(["natural", "plausible", "forced", "none"]),
+        "product_moments": _arr(STR),
+        "brand_fit": {
+            "type": "object",
+            "properties": {
+                "tone": _enum(["match", "neutral", "clash"]),
+                "price_tier": _enum(["match", "neutral", "clash"]),
+                "values": _enum(["match", "neutral", "clash"]),
+            },
+            "required": ["tone", "price_tier", "values"],
         },
+        "brand_evidence": STR,
+        "archetype": STR,
+        "reason": STR,
+        "match_type": _enum(["direct", "adjacent", "lifestyle", "weak"]),
     },
-    ["channel_id", "relevance", "reason", "match_type"],
+    ["channel_id", "product_fit", "product_moments", "brand_fit",
+     "brand_evidence", "archetype", "reason", "match_type"],
 )
 
 # ---------------------------------------------------------------- Agent 4
@@ -104,16 +158,15 @@ RELEVANCE = _results(
 AUDIENCE = _results(
     {
         "channel_id": STR,
-        "audience_fit": NUM,
+        "profile": AUDIENCE_PROFILE,
+        "buyer_overlap": _enum(["strong", "good", "partial", "weak"]),
+        "evidence": _arr(STR),
         "inferred_viewer_profile": STR,
-        "purchase_intent_signal": {
-            "type": "string",
-            "enum": ["high", "medium", "low"],
-        },
+        "purchase_intent_signal": _enum(["high", "medium", "low"]),
         "reasoning": STR,
     },
-    ["channel_id", "audience_fit", "inferred_viewer_profile",
-     "purchase_intent_signal", "reasoning"],
+    ["channel_id", "profile", "buyer_overlap", "evidence",
+     "inferred_viewer_profile", "purchase_intent_signal", "reasoning"],
 )
 
 # ---------------------------------------------------------------- Agent 5
@@ -287,3 +340,80 @@ SHORTLIST_REVIEW = {
                  "gaps", "suggested_refinements", "flagged_channel_ids",
                  "diversity_note"],
 }
+
+
+# ---------------------------------------------------------------- Agent 12
+
+_ARCHETYPE = {
+    "type": "object",
+    "properties": {
+        "name": STR,
+        "why_audience_matches": STR,
+        "search_phrases": _arr(STR),
+        "category_ids": _arr(STR),
+        "uses_product_words": BOOL,
+        "known_creators": _arr({
+            "type": "object",
+            "properties": {"name": STR, "youtube_ref": STR},
+            "required": ["name", "youtube_ref"],
+        }),
+    },
+    "required": ["name", "why_audience_matches", "search_phrases",
+                 "category_ids", "uses_product_words", "known_creators"],
+}
+
+PERSONA = {
+    "type": "object",
+    "properties": {
+        "brand_profile": {
+            "type": "object",
+            "properties": {
+                "tone": STR,
+                "price_tier": _enum(["budget", "mass", "premium", "luxury"]),
+                "values": _arr(STR),
+                "avoid": _arr(STR),
+                "languages": _arr(STR),
+            },
+            "required": ["tone", "price_tier", "values", "avoid", "languages"],
+        },
+        "product_moments": _arr(STR),
+        "target_audience": AUDIENCE_PROFILE,
+        "archetypes": _arr(_ARCHETYPE),
+        # One level up: broader, more popular kinds of creator whose viewers
+        # still include the buyer. Used only when the archetypes run thin.
+        "wider_archetypes": _arr(_ARCHETYPE),
+    },
+    "required": ["brand_profile", "product_moments", "target_audience", "archetypes",
+                 "wider_archetypes"],
+}
+
+# ---------------------------------------------------------------- scout
+
+SCOUT = {
+    "type": "object",
+    "properties": {
+        "creators": _arr({
+            "type": "object",
+            "properties": {
+                "name": STR,
+                "youtube_ref": STR,
+                "archetype": STR,
+                "evidence": STR,
+            },
+            "required": ["name", "youtube_ref", "archetype", "evidence"],
+        }),
+    },
+    "required": ["creators"],
+}
+
+# ---------------------------------------------------------------- pre-screen
+
+PRESCREEN = _results(
+    {
+        "channel_id": STR,
+        "keep": BOOL,
+        "archetype": STR,
+        "reason": STR,
+    },
+    ["channel_id", "keep", "archetype", "reason"],
+)

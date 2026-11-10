@@ -1,24 +1,45 @@
 """Scoring math. No agent produces the final number.
 
 LLM numeric scores drift between runs and cannot be audited. Agents emit
-bounded judgments; Python does the arithmetic. Every rank is explainable by
-pointing at WEIGHTS below.
+bounded judgments (rubric levels with quoted evidence); Python does the
+arithmetic. Every rank is explainable by pointing at the tables below.
 
-Agent terms sum to 0.42, code terms to 0.58 — deliberate. Most of the score
-rests on measured numbers.
+The score has two halves, and relevance comes first:
+
+    fit = 100 * gate(relevance) * (0.55 * relevance + 0.45 * quality) + bonuses
+
+  * relevance — how well this creator fits THIS brand and product: who watches
+    them (audience_match), whether the product has a natural moment in their
+    content (product_fit), and whether tone, price tier and values line up
+    (brand_fit). See RELEVANCE_PARTS.
+  * quality — measured channel strength: engagement for its size, reach,
+    sponsorship track record, consistency, momentum. See WEIGHTS.
+  * gate — relevance multiplies the whole score, so no amount of engagement or
+    fame can carry a creator who is wrong for the brand. Below
+    OFF_BRIEF_BELOW a creator is excluded outright.
 """
 from __future__ import annotations
 
+import bisect
+import math
 import os
+import re
 import statistics
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 # Videos shorter than this are Shorts: a 40s Short cannot host a 90s host-read,
-# and Shorts' inflated views corrupt every ratio.
+# and Shorts' inflated views corrupt every ratio, so the two formats are never
+# measured together (see pick_sample).
 SHORTS_MAX_S = 180
 # Views are still climbing in the first week — excluded from the median.
 MIN_AGE_DAYS = 7
+# Shorts settle faster than long videos.
+SHORTS_MIN_AGE_DAYS = 3
+# A creator with at least this many settled long videos is measured on them;
+# below it, a Shorts-first creator is measured on their Shorts instead.
+MIN_LONG_SAMPLE = 4
 # Hard exclusions
 MAX_STALE_DAYS = 180
 MIN_CHANNEL_AGE_DAYS = 90
@@ -41,6 +62,14 @@ MIN_MEDIAN_VIEWS = int(os.environ.get("UPTICK_MIN_VIEWS", "100000"))
 SHORTLIST_MAX = 15
 # Below this the score is not a recommendation, it is a guess.
 RECOMMEND_MIN_SCORE = float(os.environ.get("UPTICK_MIN_SCORE", "45"))
+# The list a brand expects to see. When fewer than this many creators clear
+# the bar, the graph widens the search one level up (broader, more popular
+# kinds of creator whose viewers still include the buyer), and the shortlist
+# fills toward this number with honestly labelled picks.
+SHORTLIST_TARGET = int(os.environ.get("UPTICK_SHORTLIST_TARGET", "10"))
+# A fill pick must still clear this. Off-brief creators never reach scoring
+# (relevance gate), so everything above it fits the brand to some degree.
+FILL_MIN_SCORE = float(os.environ.get("UPTICK_FILL_MIN_SCORE", "35"))
 
 
 def _relax(excluded: list[dict], limit: int = 3) -> list[dict]:
@@ -66,36 +95,89 @@ def shortlist(ranked: list[dict]) -> tuple[list[dict], dict]:
     Returns (shown, reason) where reason explains any creators held back, so
     the interface can say why the list is short instead of looking broken.
     """
+    def pick(rows: list[dict], tier: str) -> list[dict]:
+        return [{**r, "tier": r.get("tier") or tier} for r in rows]
+
     strong = [r for r in ranked
-              if r["fit_score"] >= RECOMMEND_MIN_SCORE
-              and r["confidence"] != "low"]
+              if r["fit_score"] >= RECOMMEND_MIN_SCORE and r["confidence"] != "low"]
+    shown = pick(strong, "top")
 
-    # Keep a low-confidence creator only when it scores well and we would
-    # otherwise have almost nothing to show.
-    if len(strong) < 3:
-        extra = [r for r in ranked
-                 if r not in strong and r["fit_score"] >= RECOMMEND_MIN_SCORE]
-        strong = (strong + extra)[:3] or ranked[:3]
+    # Fill toward the target, best evidence first: strong scores on thinner
+    # data, then creators who fit the brand less directly (often the
+    # "one level up" picks from a widened search). Each is labelled.
+    if len(shown) < SHORTLIST_TARGET:
+        ids = {r["channel_id"] for r in shown}
+        thin = [r for r in ranked if r["channel_id"] not in ids
+                and r["fit_score"] >= RECOMMEND_MIN_SCORE]
+        shown += pick(thin[:SHORTLIST_TARGET - len(shown)], "limited_data")
+    if len(shown) < SHORTLIST_TARGET:
+        ids = {r["channel_id"] for r in shown}
+        broader = [r for r in ranked if r["channel_id"] not in ids
+                   and FILL_MIN_SCORE <= r["fit_score"] < RECOMMEND_MIN_SCORE]
+        shown += pick(broader[:SHORTLIST_TARGET - len(shown)], "broader")
+    if not shown:
+        shown = pick(ranked[:3], "broader")
 
-    strong.sort(key=lambda r: r["fit_score"], reverse=True)
-    shown = strong[:SHORTLIST_MAX]
-    held = len(ranked) - len(shown)
+    shown.sort(key=lambda r: r["fit_score"], reverse=True)
+    shown = diversify(shown[:SHORTLIST_MAX])
+    ids = {r["channel_id"] for r in shown}
+    rest = [r for r in ranked if r["channel_id"] not in ids]
+    held = len(rest)
 
     reason = {"held_back": held, "note": ""}
     if held > 0:
-        weak = sum(1 for r in ranked
-                   if r not in shown and r["fit_score"] < RECOMMEND_MIN_SCORE)
-        thin = held - weak
+        weak = sum(1 for r in rest if r["fit_score"] < RECOMMEND_MIN_SCORE)
+        thin = sum(1 for r in rest if r["fit_score"] >= RECOMMEND_MIN_SCORE
+                   and r["confidence"] == "low")
+        extra = held - weak - thin
         bits = []
         if weak:
-            bits.append(f"{weak} scored too low to recommend")
+            bits.append(f"{weak} scored too low for this brief")
         if thin:
-            bits.append(f"{thin} had too little evidence to judge confidently")
+            bits.append(f"{thin} had too few recent videos to judge fairly")
+        if extra:
+            bits.append(f"{extra} fell beyond the {SHORTLIST_MAX}-creator limit")
         reason["note"] = (
-            f"{held} other creator{'s' if held != 1 else ''} were found but not "
-            f"shown: " + " and ".join(bits) + "."
+            f"We also looked at {held} other creator{'s' if held != 1 else ''} "
+            f"and left {'it' if held == 1 else 'them'} out: "
+            + " and ".join(bits) + "."
         )
     return shown, reason
+
+
+def recommendable(ranked: list[dict]) -> int:
+    """How many creators clear the recommendation bar, whatever their data."""
+    return sum(1 for r in ranked if r["fit_score"] >= RECOMMEND_MIN_SCORE)
+
+# Variety: among creators whose scores are within this many points, prefer one
+# from a kind of creator not yet shown. Never promotes a weaker creator past a
+# clearly stronger one; it only breaks near-ties toward a varied list. Kept
+# small on purpose: a visibly lower score ranked above a higher one reads as a
+# bug to the person reading the list.
+DIVERSITY_WINDOW = 1.5
+DIVERSITY_PENALTY = 0.08
+
+
+def diversify(rows: list[dict]) -> list[dict]:
+    """Reorder (never filter) a score-sorted list for variety."""
+    def key(r: dict) -> str:
+        return r.get("archetype") or (r.get("agent") or {}).get("match_type") or ""
+
+    if len({key(r) for r in rows}) <= 1:
+        return list(rows)
+    pool = sorted(rows, key=lambda r: r["fit_score"], reverse=True)
+    seen: Counter = Counter()
+    out: list[dict] = []
+    while pool:
+        top = pool[0]["fit_score"]
+        window = [r for r in pool if top - r["fit_score"] <= DIVERSITY_WINDOW]
+        pick = max(window, key=lambda r: r["fit_score"]
+                   * (1 - DIVERSITY_PENALTY * seen[key(r)]))
+        out.append(pick)
+        pool.remove(pick)
+        seen[key(pick)] += 1
+    return out
+
 
 SIZE_BANDS = {
     "nano": (0, 10_000),
@@ -110,19 +192,229 @@ SIZE_BANDS = {
 }
 _BAND_ORDER = ["nano", "micro", "mid", "macro", "mega"]
 
-WEIGHTS = {
-    "relevance": 0.22,          # Agent 3
-    "audience_fit": 0.09,       # Agent 4
-    "engagement_rate": 0.15,    # code
-    "view_per_sub": 0.11,       # code
-    "sponsor_ratio": 0.10,      # code, from the paid-placement search
-    "sponsor_confidence": 0.06, # Agent 6
-    "consistency": 0.08,        # code
-    "activity": 0.03,           # code
-    "size_fit": 0.10,           # code — the brief asked for a size, honour it
-    "geo_fit": 0.06,            # code — the brief asked for a market
+# ---------------------------------------------------------------- relevance
+#
+# Three parts, each from an agent that must quote its evidence. The weights say
+# what matters most for a brand: the RIGHT PEOPLE watching comes first, then a
+# natural place for the product, then a voice the brand can stand beside.
+RELEVANCE_PARTS = {
+    "audience_match": 0.45,   # Agent 4 profile vs the target buyer, compared in code
+    "product_fit": 0.30,      # Agent 3: is there a natural moment for the product
+    "brand_fit": 0.25,        # Agent 3: tone, price tier, values
 }
-TRENDING_BONUS = 5.0
+# Share of the base score carried by relevance; quality carries the rest.
+RELEVANCE_SHARE = 0.55
+# Judged relevance below this is off-brief: excluded, whatever the numbers.
+OFF_BRIEF_BELOW = float(os.environ.get("UPTICK_MIN_RELEVANCE", "0.30"))
+
+# Rubric levels -> numbers. Ordered best to worst: a level given WITHOUT
+# evidence is moved one step down, because an unsupported claim of fit is
+# worth less than a supported one.
+PRODUCT_FIT_LEVELS = {"natural": 1.0, "plausible": 0.7, "forced": 0.3, "none": 0.05}
+BRAND_FIT_LEVELS = {"match": 1.0, "neutral": 0.6, "clash": 0.1}
+AUDIENCE_LEVELS = {"strong": 1.0, "good": 0.75, "partial": 0.45, "weak": 0.15}
+
+
+def level_value(table: dict[str, float], level: Any, evidence: Any) -> Optional[float]:
+    """A rubric level as a number, one step lower when no evidence backs it."""
+    if level not in table:
+        return None
+    order = list(table)
+    has_evidence = bool(evidence) and (
+        not isinstance(evidence, (list, tuple)) or any(str(e).strip() for e in evidence)
+    ) and (not isinstance(evidence, str) or evidence.strip())
+    i = order.index(level)
+    if not has_evidence and i < len(order) - 1:
+        i += 1
+    return table[order[i]]
+
+
+def gate(relevance: float) -> float:
+    """How much of the score a creator may keep, by how relevant they are.
+
+    0.80+ keeps everything; 0.50 keeps half; 0.20 keeps nothing. This is what
+    stops a famous, highly engaged, wrong-audience creator from ranking.
+    """
+    return max(0.0, min(1.0, (relevance - 0.2) / 0.6))
+
+
+# ---------------------------------------------------------------- audience match
+#
+# The target buyer (from the persona agent) and each creator's inferred
+# audience (from Agent 4) use the SAME schema, so the comparison is done here,
+# field by field, instead of asking a model for one opaque number.
+AUDIENCE_FIELDS = {
+    "age_bands": 0.25,
+    "life_stages": 0.20,
+    "interests": 0.25,
+    "languages": 0.15,
+    "region": 0.10,
+    "spending_power": 0.05,
+}
+_SPEND_ORDER = ["low", "mid", "high"]
+_CONF_SHRINK = {"high": 1.0, "medium": 0.75, "low": 0.4}
+
+
+def _as_weights(v: Any) -> dict[str, float]:
+    """A list of {key, weight} or of plain strings, as normalized weights."""
+    out: dict[str, float] = {}
+    for item in v or []:
+        if isinstance(item, dict):
+            k = str(item.get("band") or item.get("key") or "").strip().lower()
+            try:
+                w = float(item.get("weight", 1.0))
+            except (TypeError, ValueError):
+                w = 1.0
+        else:
+            k, w = str(item).strip().lower(), 1.0
+        if k and w > 0:
+            out[k] = out.get(k, 0.0) + w
+    total = sum(out.values())
+    return {k: w / total for k, w in out.items()} if total > 0 else {}
+
+
+def _overlap(a: dict[str, float], b: dict[str, float]) -> Optional[float]:
+    """Shared mass of two weighted sets: 1.0 identical, 0.0 disjoint."""
+    if not a or not b:
+        return None
+    return sum(min(a.get(k, 0.0), b.get(k, 0.0)) for k in set(a) | set(b))
+
+
+def _jaccard(a: Any, b: Any) -> Optional[float]:
+    sa = {str(x).strip().lower() for x in a or [] if str(x).strip()}
+    sb = {str(x).strip().lower() for x in b or [] if str(x).strip()}
+    if not sa or not sb:
+        return None
+    # How much of what the brand wants this audience covers, softened by the
+    # plain Jaccard so a creator with fifty interests does not win by breadth.
+    cover = len(sa & sb) / len(sa)
+    jac = len(sa & sb) / len(sa | sb)
+    return 0.7 * cover + 0.3 * jac
+
+
+def audience_match(target: dict, creator: dict) -> tuple[Optional[float], dict]:
+    """Field-by-field fit of a creator's inferred audience to the target buyer.
+
+    Each field's similarity is pulled toward 0.5 by the LOWER of the two
+    confidences, and a field either side left blank is dropped and the rest
+    renormalized. Returns (score or None, per-field detail for the UI).
+    """
+    if not isinstance(target, dict) or not isinstance(creator, dict):
+        return None, {}
+    sims: dict[str, Optional[float]] = {}
+    sims["age_bands"] = _overlap(_as_weights(target.get("age_bands")),
+                                 _as_weights(creator.get("age_bands")))
+    sims["life_stages"] = _jaccard(target.get("life_stages"), creator.get("life_stages"))
+    sims["interests"] = _jaccard(target.get("interests"), creator.get("interests"))
+    tl = {str(x).lower()[:2] for x in target.get("languages") or [] if x}
+    cl = {str(x).lower()[:2] for x in creator.get("languages") or [] if x}
+    sims["languages"] = (1.0 if tl & cl else 0.0) if tl and cl else None
+    tr, cr = (target.get("region") or "").upper(), (creator.get("region") or "").upper()
+    sims["region"] = (1.0 if tr == cr else 0.0) if tr and cr else None
+    ts_, cs_ = target.get("spending_power"), creator.get("spending_power")
+    if ts_ in _SPEND_ORDER and cs_ in _SPEND_ORDER:
+        sims["spending_power"] = 1.0 - abs(_SPEND_ORDER.index(ts_) - _SPEND_ORDER.index(cs_)) / 2
+    else:
+        sims["spending_power"] = None
+
+    tconf = target.get("confidence") or {}
+    cconf = creator.get("confidence") or {}
+    detail: dict[str, dict] = {}
+    num = den = 0.0
+    for f, w in AUDIENCE_FIELDS.items():
+        v = sims.get(f)
+        if v is None:
+            continue
+        shrink = min(_CONF_SHRINK.get(tconf.get(f) if isinstance(tconf, dict) else None, 0.75),
+                     _CONF_SHRINK.get(cconf.get(f) if isinstance(cconf, dict) else None, 0.75))
+        adj = 0.5 + (v - 0.5) * shrink
+        detail[f] = {"similarity": round(v, 3), "adjusted": round(adj, 3)}
+        num += w * adj
+        den += w
+    if den <= 0:
+        return None, detail
+    return num / den, detail
+
+
+def relevance_parts(
+    rel: dict | None, aud: dict | None, target: dict | None, failed: set[str],
+) -> tuple[dict[str, Optional[float]], dict]:
+    """The three relevance parts for one creator, or None where unjudged.
+
+    Accepts the old single-number rows too (relevance, audience_fit), so a
+    cached or legacy judgment still scores rather than vanishing.
+    """
+    parts: dict[str, Optional[float]] = {k: None for k in RELEVANCE_PARTS}
+    detail: dict = {}
+
+    if "audience_analyst" not in failed and aud:
+        prof = aud.get("profile")
+        if target and isinstance(prof, dict):
+            parts["audience_match"], detail["audience_fields"] = audience_match(target, prof)
+        if parts["audience_match"] is None:
+            lvl = aud.get("buyer_overlap")
+            if lvl in AUDIENCE_LEVELS:
+                parts["audience_match"] = level_value(AUDIENCE_LEVELS, lvl, aud.get("evidence"))
+            elif aud.get("audience_fit") is not None:
+                parts["audience_match"] = _clamp(aud.get("audience_fit"))
+
+    if "relevance_judge" not in failed and rel:
+        lvl = rel.get("product_fit")
+        if lvl in PRODUCT_FIT_LEVELS:
+            parts["product_fit"] = level_value(
+                PRODUCT_FIT_LEVELS, lvl, rel.get("product_moments"))
+        elif rel.get("relevance") is not None:
+            parts["product_fit"] = _clamp(rel.get("relevance"))
+        bf = rel.get("brand_fit")
+        if isinstance(bf, dict):
+            vals = [level_value(BRAND_FIT_LEVELS, bf.get(k), rel.get("brand_evidence"))
+                    for k in ("tone", "price_tier", "values")]
+            vals = [v for v in vals if v is not None]
+            if vals:
+                parts["brand_fit"] = sum(vals) / len(vals)
+    return parts, detail
+
+
+def _clamp(v: Any) -> Optional[float]:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f:
+        return None
+    return max(0.0, min(1.0, f))
+
+
+# ---------------------------------------------------------------- quality
+
+# Measured channel strength. Relevance is NOT in here: it gates and leads the
+# score separately, so these weights only decide between creators who fit.
+WEIGHTS = {
+    "engagement_rate": 0.20,    # size-adjusted percentile within the set
+    "reach": 0.14,              # median views, percentile within the set
+    "view_per_sub": 0.12,       # percentile within the set
+    "size_fit": 0.12,           # the brief asked for a size, honour it
+    "sponsor_ratio": 0.10,      # share of their own uploads that are sponsored
+    "sponsor_confidence": 0.08, # Agent 6
+    "consistency": 0.08,        # spread of log views
+    "momentum": 0.07,           # recent uploads vs the ones before
+    "geo_fit": 0.06,            # the brief asked for a market
+    "activity": 0.03,
+}
+
+# Popularity: on the chart today, and how many of the last 14 days. A bonus,
+# scaled by the gate, so it lifts creators who fit and never rescues one who
+# does not.
+POPULARITY_BONUS_MAX = 6.0
+
+
+def popularity_bonus(trending_days: int, trending_today: bool) -> float:
+    days = max(int(trending_days or 0), 1 if trending_today else 0)
+    if days <= 0:
+        return 0.0
+    return min(POPULARITY_BONUS_MAX, 2.0 + (days - 1) * 1.0)
+
+
 
 # Cultural standing is a BONUS, never a weighted term.
 #
@@ -211,24 +503,118 @@ def _int(d: dict, key: str) -> Optional[int]:
         return None
 
 
-def eligible_videos(videos: list[dict]) -> list[dict]:
-    """Drop Shorts, live/premieres, and videos too young to have settled."""
+def eligible_videos(videos: list[dict], fmt: str = "long") -> list[dict]:
+    """The videos a creator is measured on, for one format.
+
+    "long" drops Shorts, live/premieres and videos too young to have settled.
+    "shorts" keeps only Shorts, settled for SHORTS_MIN_AGE_DAYS (Shorts views
+    plateau within days, not weeks). The two are never mixed in one sample:
+    Shorts views run far higher, so mixing would corrupt every median.
+    """
     out = []
     for v in videos:
         snip = v.get("snippet", {})
         if snip.get("liveBroadcastContent", "none") != "none":
             continue
-        if (v.get("_duration_s") or 0) < SHORTS_MAX_S:
-            continue
+        dur = v.get("_duration_s") or 0
         a = age_days(snip.get("publishedAt"))
-        if a is None or a < MIN_AGE_DAYS:
-            continue
+        if fmt == "shorts":
+            if not (0 < dur < SHORTS_MAX_S):
+                continue
+            if a is None or a < SHORTS_MIN_AGE_DAYS:
+                continue
+        else:
+            if dur < SHORTS_MAX_S:
+                continue
+            if a is None or a < MIN_AGE_DAYS:
+                continue
         out.append(v)
     return out
 
 
+def pick_sample(videos: list[dict]) -> tuple[str, list[dict]]:
+    """Measure a creator on the format they actually make.
+
+    Long-form when there is enough of it (a host-read fits there best), else
+    Shorts when the creator is mainly a Shorts creator. Much of a market's
+    attention, India's especially, lives in Shorts; dropping every Shorts-first
+    creator as "insufficient data" threw most of the trending chart away.
+    """
+    long = eligible_videos(videos, "long")
+    if len(long) >= MIN_LONG_SAMPLE:
+        return "long", long
+    shorts = eligible_videos(videos, "shorts")
+    if len(shorts) > len(long):
+        return "shorts", shorts
+    return "long", long
+
+
+# ---------------------------------------------------------------- sponsorship
+
+# Phrases creators use to disclose a deal in a description. Deterministic, so
+# the sponsorship term never depends on a model reading the text.
+_SPONSOR_RE = re.compile(
+    r"(sponsored by|this video is sponsored|thanks to [^.\n]{1,40} for sponsoring"
+    r"|paid promotion|paid partnership|in partnership with|partnered with"
+    r"|use (?:my |our )?code|promo code|coupon code|discount code"
+    r"|#ad\b|#sponsored|#paidpartnership)",
+    re.I,
+)
+
+
+def sponsor_signals(videos: list[dict], paid_ids: set[str] | None = None) -> dict:
+    """How often this creator runs sponsored content, from their OWN uploads.
+
+    Counts a video as sponsored when the creator ticked YouTube's paid
+    promotion box on it, it came back from the paid-placement search, or its
+    description discloses a deal. The ratio is None when nothing sponsored was
+    seen: disclosure is self-declared and under-reported, so absence is
+    missing evidence, never a zero.
+    """
+    paid_ids = paid_ids or set()
+    _, elig = pick_sample(videos)
+    declared = described = sponsored = 0
+    last: Optional[float] = None
+    for v in elig:
+        d = bool((v.get("paidProductPlacementDetails") or {}).get("hasPaidProductPlacement")) \
+            or v.get("id") in paid_ids
+        t = bool(_SPONSOR_RE.search((v.get("snippet") or {}).get("description") or ""))
+        declared += d
+        described += t
+        if d or t:
+            sponsored += 1
+            age = age_days((v.get("snippet") or {}).get("publishedAt"))
+            if age is not None and (last is None or age < last):
+                last = age
+    return {
+        "sponsored_videos": sponsored,
+        "declared_paid_videos": declared,
+        "described_sponsor_videos": described,
+        "ratio": (sponsored / len(elig)) if (elig and sponsored) else None,
+        "last_sponsored_days": last,
+    }
+
+
+def sponsor_term(ratio: Optional[float]) -> Optional[float]:
+    """Sponsorship ratio as a score: proof they take deals, without ad fatigue.
+
+    A creator sponsoring roughly one video in four is the sweet spot. Nearly
+    every video sponsored means viewers have learned to skip the read.
+    """
+    if ratio is None or ratio <= 0:
+        return None
+    if ratio < 0.15:
+        return 0.6 + 0.4 * ratio / 0.15
+    if ratio <= 0.35:
+        return 1.0
+    if ratio <= 0.7:
+        return 1.0 - 0.5 * (ratio - 0.35) / 0.35
+    return 0.5
+
+
 def channel_metrics(
-    channel: dict, videos: list[dict], paid_hits: int, videos_surfaced: int
+    channel: dict, videos: list[dict], paid_hits: int, videos_surfaced: int,
+    paid_ids: set[str] | None = None,
 ) -> dict:
     """Per-channel raw metrics. Median, never mean.
 
@@ -243,7 +629,7 @@ def channel_metrics(
     if subs is not None and subs <= 0:
         subs = None
 
-    elig = eligible_videos(videos)
+    fmt, elig = pick_sample(videos)
     views = [_int(v.get("statistics", {}), "viewCount") for v in elig]
     views = [x for x in views if x is not None]
 
@@ -264,14 +650,36 @@ def channel_metrics(
 
     view_per_sub = (median_views / subs) if (median_views is not None and subs) else None
 
+    # Spread of LOG views: views are heavy-tailed, so the coefficient of
+    # variation swings wildly on one viral upload. A standard deviation of 0.6
+    # in log10 (one video routinely 4x another) scores zero.
     consistency = None
-    if len(views) >= 3:
-        mean = statistics.mean(views)
-        if mean > 0:
-            consistency = 1.0 - min(1.0, statistics.stdev(views) / mean)
+    logs = [math.log10(x) for x in views if x > 0]
+    if len(logs) >= 3:
+        consistency = max(0.0, 1.0 - statistics.stdev(logs) / 0.6)
 
-    sponsor_ratio = (paid_hits / videos_surfaced) if videos_surfaced else 0.0
-    sponsor_ratio = max(0.0, min(1.0, sponsor_ratio))
+    # Momentum: the last five uploads against the ones before them. 0.5 is
+    # flat, 1.0 is doubling, 0.0 is halving.
+    momentum = None
+    dated = sorted(
+        (
+            (age_days(v.get("snippet", {}).get("publishedAt")) or 0.0,
+             _int(v.get("statistics", {}), "viewCount"))
+            for v in elig
+        ),
+        key=lambda t: t[0],
+    )
+    dated = [vc for _, vc in dated if vc is not None]
+    if len(dated) >= 8:
+        recent = statistics.median(dated[:5])
+        older = statistics.median(dated[5:20])
+        if recent > 0 and older > 0:
+            momentum = max(0.0, min(1.0, 0.5 + math.log2(recent / older) / 2))
+
+    sponsor = sponsor_signals(videos, paid_ids)
+    if not paid_ids and paid_hits and sponsor["ratio"] is None and videos_surfaced:
+        # Older callers pass only a count of paid-search hits.
+        sponsor["ratio"] = max(0.0, min(1.0, paid_hits / videos_surfaced))
 
     last_upload_days = None
     pub_dates = [age_days(v.get("snippet", {}).get("publishedAt")) for v in videos]
@@ -295,11 +703,17 @@ def channel_metrics(
         "engagement_rate": engagement_rate,
         "view_per_sub": view_per_sub,
         "consistency": consistency,
-        "sponsor_ratio": sponsor_ratio,
+        "momentum": momentum,
+        "sponsor_ratio": sponsor["ratio"],
+        "sponsored_videos": sponsor["sponsored_videos"],
+        "declared_paid_videos": sponsor["declared_paid_videos"],
+        "last_sponsored_days": sponsor["last_sponsored_days"],
         "activity": activity,
         "paid_placement_hits": paid_hits,
         "videos_surfaced": videos_surfaced,
         "eligible_video_count": len(elig),
+        # Which format the numbers above describe: "long" or "shorts".
+        "format": fmt,
         "last_upload_days": last_upload_days,
         "channel_age_days": age_days(channel.get("snippet", {}).get("publishedAt")),
         "likes_visible": any(
@@ -401,6 +815,138 @@ def normalize(values: dict[str, Optional[float]]) -> dict[str, Optional[float]]:
     }
 
 
+def percentile(values: dict[str, Optional[float]]) -> dict[str, Optional[float]]:
+    """Rank within the CURRENT candidate set, as 0..1 (ties share a rank).
+
+    Replaces min-max for the code terms: with min-max one viral outlier
+    squashes everyone else toward zero, while a rank only cares about order.
+    A single candidate, or an all-equal set, scores 0.5.
+    """
+    present = sorted(v for v in values.values() if v is not None)
+    n = len(present)
+    out: dict[str, Optional[float]] = {}
+    for k, v in values.items():
+        if v is None:
+            out[k] = None
+        elif n == 1:
+            out[k] = 0.5
+        else:
+            lo = bisect.bisect_left(present, v)
+            hi = bisect.bisect_right(present, v) - 1
+            out[k] = ((lo + hi) / 2) / (n - 1)
+    return out
+
+
+def size_adjusted(
+    er: dict[str, Optional[float]], subs: dict[str, Optional[int]], min_points: int = 6,
+) -> dict[str, Optional[float]]:
+    """Engagement judged against what is normal FOR THE CHANNEL'S SIZE.
+
+    Engagement rate falls as channels grow, so a raw comparison always favours
+    the smallest channel in the set. Fit log(ER) against log(subs) across the
+    set and rank the residuals: "more engaged than a channel this size usually
+    is". Falls back to a plain rank when there are too few points to fit.
+    """
+    pts = {k: (math.log(subs[k]), math.log(v)) for k, v in er.items()
+           if v and v > 0 and subs.get(k)}
+    if len(pts) < min_points:
+        return percentile(er)
+    xs = [x for x, _ in pts.values()]
+    ys = [y for _, y in pts.values()]
+    mx, my = statistics.mean(xs), statistics.mean(ys)
+    var = sum((x - mx) ** 2 for x in xs)
+    if var <= 1e-12:
+        return percentile(er)
+    slope = sum((x - mx) * (y - my) for x, y in pts.values()) / var
+    resid: dict[str, Optional[float]] = {}
+    for k, v in er.items():
+        if not v or v <= 0:
+            resid[k] = None
+        elif k in pts:
+            x, y = pts[k]
+            resid[k] = y - (my + slope * (x - mx))
+        else:
+            # Hidden subscriber count: compare with the set's typical level.
+            resid[k] = math.log(v) - my
+    return percentile(resid)
+
+
+def prefilter(channel: dict, size_band: str, region_code: str | None) -> tuple[str, str]:
+    """Screen a channel on its stats alone, before any video is fetched.
+
+    Returns (verdict, reason):
+      "drop"     — excluded on principle (made for kids, too new)
+      "overflow" — below the reach floor, outside the size band, or based in
+                   another market. Kept in reserve so a thin search can still
+                   show its closest near-misses instead of a blank page.
+      "keep"     — worth spending enrichment on.
+
+    Runs on every channel discovery finds, so the expensive per-creator steps
+    are spent only on creators who could actually be recommended.
+    """
+    if (channel.get("status") or {}).get("madeForKids"):
+        return "drop", "made for kids (COPPA ad restrictions)"
+    age = age_days((channel.get("snippet") or {}).get("publishedAt"))
+    if age is not None and age < MIN_CHANNEL_AGE_DAYS:
+        return "drop", "channel less than 90 days old"
+    title = (channel.get("snippet") or {}).get("title") or ""
+    if title.endswith(" - Topic") or "vevo" in title.lower():
+        return "drop", "auto-generated music or label channel"
+    stats = channel.get("statistics") or {}
+    subs = None if stats.get("hiddenSubscriberCount") else _int(stats, "subscriberCount")
+    if subs is not None and 0 < subs < MIN_SUBSCRIBERS:
+        return "overflow", f"under {MIN_SUBSCRIBERS:,} subscribers ({subs:,})"
+    if band_distance(subs, size_band) > MAX_BAND_DISTANCE:
+        return "overflow", f"far outside the requested {size_band}-tier size band"
+    country = (channel.get("snippet") or {}).get("country")
+    if geo_fit(country, region_code) == 0.0:
+        return "overflow", f"based in {country}, the brief asked for {region_code}"
+    return "keep", ""
+
+
+def hard_exclusion(c: dict, size_band: str) -> Optional[str]:
+    """Why this enriched creator can never be recommended, or None.
+
+    Code-only (channel stats and measured metrics), so the graph can apply it
+    BEFORE any model judges the creator: a creator who will be excluded anyway
+    is not worth paying four judges to read.
+    """
+    ch, m = c["channel"], c["metrics"]
+    if ch.get("status", {}).get("madeForKids"):
+        return "made for kids (COPPA ad restrictions)"
+    if m["channel_age_days"] is not None and m["channel_age_days"] < MIN_CHANNEL_AGE_DAYS:
+        return "channel less than 90 days old"
+    if m["last_upload_days"] is None or m["last_upload_days"] > MAX_STALE_DAYS:
+        return "no upload in the last 180 days"
+    if confidence(m) == "insufficient":
+        return "insufficient data (under 2 usable videos)"
+
+    # Reach floors, applied after the data-quality checks so the reason given
+    # is the most specific one.
+    subs = m["subscriber_count"]
+    if subs is not None and subs < MIN_SUBSCRIBERS:
+        return f"under {MIN_SUBSCRIBERS:,} subscribers ({subs:,})"
+    mv = m["median_views"]
+    if mv is None or mv < MIN_MEDIAN_VIEWS:
+        return (f"median views below {MIN_MEDIAN_VIEWS:,}"
+                + (f" ({int(mv):,})" if mv is not None else ""))
+
+    # Size band, as a hard rule rather than a scoring nudge.
+    #
+    # A brief that says "mid-tier" is usually saying "this is the budget".
+    # A 20M-subscriber channel is not an imperfect answer to that, it is an
+    # unaffordable one, and letting a strong engagement score outweigh it is
+    # how a shortlist ends up recommending creators nobody can book.
+    if band_distance(subs, size_band) > MAX_BAND_DISTANCE:
+        subs_txt = f"{subs:,}" if subs is not None else "unknown"
+        return (f"far outside the requested {size_band}-tier size band "
+                f"({subs_txt} subscribers)")
+    return None
+
+
+SIZE_EXCLUSIONS = ("subscribers", "median views", "size band")
+
+
 def score_candidates(
     candidates: list[dict],
     relevance: dict[str, dict],
@@ -413,78 +959,51 @@ def score_candidates(
     cultural: dict[str, dict] | None = None,
     target_generation: str | None = None,
     region_code: str | None = None,
+    target_audience: dict | None = None,
+    trending_days: dict[str, int] | None = None,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """Returns (ranked, review_manually, excluded).
 
     Any missing term — a failed agent or an unmeasurable metric — has its
-    weight dropped and the remainder renormalized to 1.0. The query never
-    fails; it degrades and is marked partial.
+    weight dropped and the remainder renormalized. The query never fails; it
+    degrades and is marked partial.
     """
     excluded: list[dict] = []
     live: list[dict] = []
 
     # ---- hard exclusions, before scoring
     for c in candidates:
-        ch, m = c["channel"], c["metrics"]
-        if ch.get("status", {}).get("madeForKids"):
-            excluded.append({**c, "exclusion": "made for kids (COPPA ad restrictions)"})
-            continue
-        if m["channel_age_days"] is not None and m["channel_age_days"] < MIN_CHANNEL_AGE_DAYS:
-            excluded.append({**c, "exclusion": "channel less than 90 days old"})
-            continue
-        if m["last_upload_days"] is None or m["last_upload_days"] > MAX_STALE_DAYS:
-            excluded.append({**c, "exclusion": "no upload in the last 180 days"})
-            continue
-        if confidence(m) == "insufficient":
-            excluded.append({**c, "exclusion": "insufficient data (under 2 usable videos)"})
-            continue
-
-        # Reach floors, applied after the data-quality checks so the reason
-        # given is the most specific one.
-        subs = m["subscriber_count"]
-        if subs is not None and subs < MIN_SUBSCRIBERS:
-            excluded.append({
-                **c,
-                "exclusion": f"under {MIN_SUBSCRIBERS:,} subscribers "
-                             f"({subs:,})",
-            })
-            continue
-        mv = m["median_views"]
-        if mv is None or mv < MIN_MEDIAN_VIEWS:
-            excluded.append({
-                **c,
-                "exclusion": (f"median views below {MIN_MEDIAN_VIEWS:,}"
-                              + (f" ({int(mv):,})" if mv is not None else "")),
-            })
-            continue
-
-        # Size band, as a hard rule rather than a scoring nudge.
-        #
-        # A brief that says "mid-tier" is usually saying "this is the budget".
-        # A 20M-subscriber channel is not an imperfect answer to that, it is
-        # an unaffordable one, and letting a strong engagement score outweigh
-        # it is how a shortlist ends up recommending creators nobody can book.
-        dist = band_distance(m["subscriber_count"], size_band)
-        if dist > MAX_BAND_DISTANCE:
-            subs_txt = (f"{m['subscriber_count']:,}"
-                        if m["subscriber_count"] is not None else "unknown")
-            excluded.append({
-                **c,
-                "exclusion": f"far outside the requested {size_band}-tier size "
-                             f"band ({subs_txt} subscribers)",
-            })
-            continue
-        live.append(c)
+        why = hard_exclusion(c, size_band)
+        if why:
+            excluded.append({**c, "exclusion": why})
+        else:
+            live.append(c)
 
     if not live:
         return [], [], excluded
 
-    # ---- min-max normalization across the surviving set
-    norm_er = normalize({c["channel_id"]: c["metrics"]["engagement_rate"] for c in live})
-    norm_vps = normalize({c["channel_id"]: c["metrics"]["view_per_sub"] for c in live})
+    # ---- relative terms across the surviving set, within each format: a
+    # Shorts creator's views are compared with other Shorts creators', never
+    # with a long-form creator's.
+    norm_er: dict[str, Optional[float]] = {}
+    norm_vps: dict[str, Optional[float]] = {}
+    norm_reach: dict[str, Optional[float]] = {}
+    by_fmt: dict[str, list[dict]] = {}
+    for c in live:
+        by_fmt.setdefault(c["metrics"].get("format") or "long", []).append(c)
+    for grp in by_fmt.values():
+        norm_er.update(size_adjusted(
+            {c["channel_id"]: c["metrics"]["engagement_rate"] for c in grp},
+            {c["channel_id"]: c["metrics"]["subscriber_count"] for c in grp},
+        ))
+        norm_vps.update(percentile(
+            {c["channel_id"]: c["metrics"]["view_per_sub"] for c in grp}))
+        norm_reach.update(percentile(
+            {c["channel_id"]: c["metrics"]["median_views"] for c in grp}))
 
     ranked: list[dict] = []
     review: list[dict] = []
+    tdays = trending_days or {}
 
     for c in live:
         cid, m = c["channel_id"], c["metrics"]
@@ -493,53 +1012,75 @@ def score_candidates(
         saf = safety.get(cid) or {}
         spo = sponsorship.get(cid) or {}
 
-        # A missing row from a live agent is neutral 0.5, not zero — absence of
-        # a judgment is not a negative judgment.
+        # ---- relevance: the three parts, the gate, the off-brief rule
+        parts, rel_detail = relevance_parts(rel, aud, target_audience, failed_agents)
+        present = {k: v for k, v in parts.items() if v is not None}
+        if present:
+            rw = sum(RELEVANCE_PARTS[k] for k in present)
+            r = sum(RELEVANCE_PARTS[k] * v for k, v in present.items()) / rw
+            g = gate(r)
+            if r < OFF_BRIEF_BELOW:
+                excluded.append({
+                    **c,
+                    "exclusion": f"off-brief: relevance {r:.2f} is below "
+                                 f"{OFF_BRIEF_BELOW:.2f} for this brand and product",
+                })
+                continue
+        else:
+            # Nobody could judge this creator. Neutral, not negative, and the
+            # gate is not applied to a judgment that was never made.
+            rw, r, g = 0.0, 0.5, 1.0
+
+        # ---- quality
         terms: dict[str, Optional[float]] = {
-            "relevance": None if "relevance_judge" in failed_agents
-                         else (rel.get("relevance") if rel else 0.5),
-            "audience_fit": None if "audience_analyst" in failed_agents
-                            else (aud.get("audience_fit") if aud else 0.5),
             "engagement_rate": norm_er[cid],
+            "reach": norm_reach[cid],
             "view_per_sub": norm_vps[cid],
-            "sponsor_ratio": m["sponsor_ratio"],
-            "sponsor_confidence": None if "sponsorship_analyst" in failed_agents
-                                  else (spo.get("sponsor_confidence") if spo else 0.0),
-            "consistency": m["consistency"],
-            "activity": m["activity"],
             "size_fit": size_fit(m["subscriber_count"], size_band),
+            "sponsor_ratio": sponsor_term(m.get("sponsor_ratio")),
+            "sponsor_confidence": None if "sponsorship_analyst" in failed_agents
+                                  else (_clamp(spo.get("sponsor_confidence")) if spo else None),
+            "consistency": m["consistency"],
+            "momentum": m.get("momentum"),
             "geo_fit": geo_fit(
                 c["channel"].get("snippet", {}).get("country"), region_code
             ),
+            "activity": m["activity"],
         }
-
-        # Drop unusable terms, renormalize the rest to 1.0.
         usable = {k: v for k, v in terms.items() if v is not None}
         total_w = sum(WEIGHTS[k] for k in usable)
-        if total_w <= 0:
-            continue
-        raw = sum(WEIGHTS[k] * usable[k] for k in usable) / total_w
+        q = (sum(WEIGHTS[k] * usable[k] for k in usable) / total_w) if total_w > 0 else 0.5
+
+        base = g * (RELEVANCE_SHARE * r + (1 - RELEVANCE_SHARE) * q)
 
         is_trending = cid in trending
         cul_row = (cultural or {}).get(cid)
         cul_bonus, cul_reason = cultural_bonus(cul_row, target_generation)
-        fit = round(
-            100.0 * raw
-            + (TRENDING_BONUS if is_trending else 0.0)
-            + cul_bonus,
-            1,
-        )
-        fit = min(100.0, fit)
+        pop_bonus = popularity_bonus(tdays.get(cid, 0), is_trending)
+        # Bonuses are scaled by the gate too: fame lifts a creator who fits,
+        # and does nothing for one who does not.
+        fit = round(min(100.0, 100.0 * base + g * (cul_bonus + pop_bonus)), 1)
 
-        breakdown = [
-            {
-                "term": k,
-                "value": round(usable[k], 4),
-                "weight": round(WEIGHTS[k] / total_w, 4),
-                "contribution": round(100.0 * WEIGHTS[k] / total_w * usable[k], 2),
-            }
-            for k in sorted(usable, key=lambda x: -WEIGHTS[x])
-        ]
+        breakdown: list[dict] = []
+        if present:
+            for k in sorted(present, key=lambda x: -RELEVANCE_PARTS[x]):
+                w = g * RELEVANCE_SHARE * RELEVANCE_PARTS[k] / rw
+                breakdown.append({"term": k, "group": "relevance",
+                                  "value": round(present[k], 4), "weight": round(w, 4),
+                                  "contribution": round(100.0 * w * present[k], 2)})
+        else:
+            w = g * RELEVANCE_SHARE
+            breakdown.append({"term": "relevance", "group": "relevance",
+                              "value": 0.5, "weight": round(w, 4),
+                              "contribution": round(100.0 * w * 0.5, 2)})
+        for k in sorted(usable, key=lambda x: -WEIGHTS[x]):
+            w = g * (1 - RELEVANCE_SHARE) * WEIGHTS[k] / total_w
+            breakdown.append({"term": k, "group": "quality",
+                              "value": round(usable[k], 4), "weight": round(w, 4),
+                              "contribution": round(100.0 * w * usable[k], 2)})
+
+        dropped = [k for k, v in parts.items() if v is None] + \
+                  [k for k, v in terms.items() if v is None]
 
         row = {
             "channel_id": cid,
@@ -548,21 +1089,41 @@ def score_candidates(
             "country": c["channel"].get("snippet", {}).get("country"),
             "url": f"https://www.youtube.com/channel/{cid}",
             "fit_score": fit,
+            "size_band": size_band,
             "confidence": confidence(m),
-            "partial": bool(failed_agents) or len(usable) < len(WEIGHTS),
+            "partial": bool(failed_agents) or bool(dropped),
             "trending": is_trending,
-            "cultural_bonus": cul_bonus,
+            "trending_days": tdays.get(cid, 0),
+            "popularity_bonus": round(g * pop_bonus, 2),
+            "cultural_bonus": round(g * cul_bonus, 2),
             "cultural_reason": cul_reason,
             "cultural": cul_row or {},
+            "found_via": c.get("found_via", []),
+            # The judge read the content; the search label only says which
+            # query happened to surface the creator.
+            "archetype": (rel.get("archetype")
+                          if rel.get("archetype") not in (None, "", "other")
+                          else c.get("archetype") or ""),
+            "relevance_score": round(r, 4) if present else None,
+            "relevance_gate": round(g, 4),
+            "relevance_detail": {
+                **rel_detail,
+                "audience_level": aud.get("buyer_overlap"),
+                "audience_evidence": aud.get("evidence") or [],
+                "product_fit": rel.get("product_fit"),
+                "product_moments": rel.get("product_moments") or [],
+                "brand_fit": rel.get("brand_fit") or {},
+                "brand_evidence": rel.get("brand_evidence") or "",
+            },
             "metrics": m,
             "breakdown": breakdown,
-            "dropped_terms": [k for k, v in terms.items() if v is None],
+            "dropped_terms": dropped,
             "top_videos": c.get("top_videos", []),
             "agent": {
-                "relevance": rel.get("relevance"),
+                "relevance": round(r, 4) if present else None,
                 "relevance_reason": rel.get("reason"),
                 "match_type": rel.get("match_type"),
-                "audience_fit": aud.get("audience_fit"),
+                "audience_fit": parts.get("audience_match"),
                 "inferred_viewer_profile": aud.get("inferred_viewer_profile"),
                 "purchase_intent_signal": aud.get("purchase_intent_signal"),
                 "audience_reasoning": aud.get("reasoning"),

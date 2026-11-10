@@ -8,7 +8,7 @@ evidence behind it, and a written rationale fact-checked against the source
 metrics.
 
 **Stack:** FastAPI + React (Vite, TypeScript, Tailwind) · LangGraph ·
-Gemini 3.5 Flash-Lite · YouTube Data API v3 · SQLite
+Gemini 3.8 Flash + 3.5 Flash-Lite · YouTube Data API v3 · SQLite
 
 ---
 
@@ -32,7 +32,7 @@ cp .env.example .env          # then add your two API keys
 ./serve.sh        # open http://localhost:8700
 ```
 
-Run the tests with `pytest`: 50 tests, no API keys or network needed.
+Run the tests with `pytest`: 148 tests, no API keys or network needed.
 
 **No keys yet?** Click **See an example**. It renders the whole interface from
 fixtures scored by the real ranking engine, so the numbers on screen are
@@ -60,19 +60,95 @@ the SSE endpoint is a thin adapter over something that already worked.
 ## How it works
 
 ```
-brief → interpret → strategize → discover → enrich → dossier
-                                                        ├→ relevance   ┐
-                                                        ├→ audience    │
-                                                        ├→ safety      ├→ score → narrate → audit
-                                                        ├→ sponsorship │
-                                                        └→ cultural ⌕  ┘
+brief → interpret ─┬→ research ⌕ ─┐
+                   └→ strategize ─┴→ persona ─┬→ discover (trending + search) ─┐
+                                              └→ scout ⌕ ─────────────────────┴→ screen
+      → enrich (+ comments, + refill) → dossier ├→ relevance   ┐
+                                                ├→ audience    │
+                                                ├→ safety      ├→ score ─┬→ narrate → audit
+                                                ├→ sponsorship │         └→ review
+                                                └→ cultural ⌕  ┘
+                     score ─(fewer than 10 clear the bar)→ widen → discover + scout → … → score
 ```
 
 ⌕ = grounded web search.
 
-Eleven Gemini agents. A cold brief takes roughly 15 to 25 seconds and spends
-4 of the 100 daily search calls, so at least 20 briefs a day are available.
-Expect **~50–60s cold, <3s warm** — the latency is the throttle, not the work.
+### Ten good creators, every time it is honest to
+
+* **Shorts creators count.** Each creator is measured on the format they
+  actually make: long videos when there are at least 4, otherwise their
+  Shorts. The two are never mixed in one median, and a Shorts creator's reach
+  is compared only with other Shorts creators'. Much of a market's trending
+  chart (India's especially) is Shorts-first; before this, those creators were
+  all dropped as "insufficient data".
+* **50 recent uploads per creator** (one playlist page, still 1 unit), so a
+  creator who mixes Shorts and long videos has enough of each to judge.
+* **Refill before judging.** A studied creator the data rules out (too few
+  videos, under the reach floors, far outside the size band) is replaced from
+  the screened pool *before* the Gemini judges read anyone, so no judging is
+  paid for on a creator who cannot be recommended.
+* **Widen one level up.** If fewer than `UPTICK_SHORTLIST_TARGET` (10)
+  creators clear the bar, the graph loops once: the persona's
+  `wider_archetypes` (broader, more popular kinds of creator whose viewers
+  still include the buyer: mainstream comedy, big lifestyle vloggers, cricket
+  commentary and so on) drive deeper trending charts and a second scout. No
+  extra `search.list` call. New finds go through the same enrich, judge and
+  score path and are ranked together with the first pass. The relevance gate
+  still applies: popularity never rescues an off-brief creator.
+* **Labelled fill.** The shortlist fills toward 10: clear recommendations
+  first, then strong scores on thin data ("Limited data"), then creators
+  scoring 35 to 45 ("Broader fit"). Each label is shown on the card.
+
+### Why each creator is there, in plain words
+
+`explain.py` turns each scored row into readable reasons and numbers: a
+summary ("Picked because their viewers look like your buyers, the product fits
+naturally into their videos…"), a caveat, and **key numbers** rounded for
+people (`1.4M` subscribers, `~600K per video`, `1.3% of viewers like or
+comment, above usual for a channel this size`, `2 of last 20 videos
+sponsored`). The rationale writer and the output auditor read the same facts,
+so true claims about the audience or a sponsor pass. When the writer's note
+cannot be confirmed, the card shows the code-written summary instead of
+nothing.
+
+A cold brief spends **3 of the 100 daily search calls** (one paid-placement
+search and two archetype searches), so about 30 briefs a day are available.
+Trending charts, handle lookups, uploads and comments cost 1 unit each and no
+search calls.
+
+### Relevance first: who buys this, and who do they watch
+
+The tool's job is the most relevant top creators for a brand, so discovery and
+scoring both start from the buyer rather than the product category:
+
+1. **Persona (Agent 12).** From the brief and the market research it writes the
+   brand profile (tone, price tier, values, what to avoid), the moments the
+   product is used in, the target buyer as a structured profile, and 4–6
+   **creator archetypes** whose audience *is* that buyer. At least two must use
+   no product words: buyers of most products are watching comedy, campus,
+   gaming or lifestyle content, not reviews of the product.
+2. **Three sources, side by side.** The trending charts for the market and for
+   each archetype's YouTube category (a real source now, not just a +5 flag); a
+   grounded **scout** that names real creators per archetype; and three
+   YouTube searches.
+3. **Screen.** Every named creator is resolved to a real channel (`@handle`,
+   channel URL or video link). One that does not resolve was invented and is
+   dropped. The whole pool is checked on channel stats (1 unit per 50) before
+   any per-creator spend; a large pool is pre-screened for audience fit on
+   cheap fields, which clears out the studios, labels and news networks that
+   dominate trending. Creators found by **independent sources** (scout and
+   trending, say) are studied first.
+4. **Audience evidence.** Each studied creator gets a sample of viewer
+   comments, their tags, topics and audio language. Comments are the best
+   public signal of who watches: the language viewers write in, where they
+   are, what stage of life they mention.
+5. **Three-part relevance**, each needing quoted evidence (see Scoring).
+
+Trending history is stored daily, so a creator's **days on the chart in the
+last 14** counts toward popularity, rather than one day's spike. On Vercel this
+needs a persistent database to accumulate across deploys.
+Expect **under a minute cold, <3s warm**. Gemini calls are not paced per
+minute (paid tier); the monthly spend gate in `budget.py` is the limit.
 
 ### The two rules that save the project
 
@@ -187,24 +263,34 @@ matched result looks plausible while the better creators were never surfaced.
 
 ### Scoring is pure code
 
-No agent produces the final number. LLM scores drift between runs and cannot be
-audited; agents emit bounded judgments and Python does the arithmetic, so every
-rank is explainable by pointing at `metrics.WEIGHTS`.
+No agent produces the final number. Agents emit **rubric levels with quoted
+evidence**; Python turns them into numbers and does the arithmetic.
 
-| Term | Weight | Source |
+```
+fit = 100 · gate(relevance) · (0.55 · relevance + 0.45 · quality) + gate · bonuses
+gate(r) = clamp((r − 0.2) / 0.6, 0, 1)        relevance < 0.30 → excluded as off-brief
+```
+
+**Relevance** (`metrics.RELEVANCE_PARTS`):
+
+| Part | Weight | How it is judged |
 |---|---|---|
-| relevance | 0.25 | Agent 3 |
-| engagement_rate | 0.18 | code |
-| view_per_sub | 0.13 | code |
-| sponsor_ratio | 0.12 | code |
-| consistency | 0.10 | code |
-| audience_fit | 0.10 | Agent 4 |
-| sponsor_confidence | 0.07 | Agent 6 |
-| activity | 0.03 | code |
-| size_fit | 0.02 | code |
+| audience_match | 0.45 | Agent 4 infers the creator's audience (age bands, life stage, interests, language, country, spending) from content and comments; code compares it field by field with the target buyer |
+| product_fit | 0.30 | Agent 3: `natural / plausible / forced / none`, quoting the videos where it fits |
+| brand_fit | 0.25 | Agent 3: tone, price tier and values each `match / neutral / clash` |
 
-Agent terms **0.42**, code terms **0.58** — deliberate. Agent 5 (safety) carries
-no weight; it gates and annotates, and a human decides.
+A level given without evidence is moved down one step in code. Low-confidence
+audience fields are pulled toward neutral.
+
+**Quality** (`metrics.WEIGHTS`): engagement judged *for the channel's size*
+(0.20), reach (0.14), views per subscriber (0.12), size fit (0.12), the share
+of their own uploads that are sponsored (0.10), Agent 6's sponsor confidence
+(0.08), consistency (0.08), momentum (0.07), market fit (0.06), activity (0.03).
+
+**Bonuses**, scaled by the gate: popularity from trending (up to +6) and
+cultural standing (up to +12). Fame lifts a creator who fits and does nothing
+for one who does not. Agent 5 (safety) carries no weight; it gates and
+annotates, and a human decides.
 
 Three choices do most of the work:
 - **Median, never mean.** Views of 10k/12k/11k/9k/2.4M give a mean of ~488k and
@@ -212,9 +298,13 @@ Three choices do most of the work:
 - **Ratios, never raw counts.** A 50k-sub channel at 40k median views beats a
   10M-sub channel at 200k. Ranking by raw count just ranks by size, which the
   user can do for free.
-- **`norm()` is min-max within the current candidate set.** Engagement norms
-  differ wildly between gaming and finance; only relative comparison means
-  anything.
+- **Percentile ranks within the current candidate set**, not min-max, so one
+  viral outlier cannot squash everyone else. Engagement is ranked on the
+  residual of log engagement against log subscribers, because raw engagement
+  always favours the smallest channel.
+- **Sponsorship from the creator's own uploads**: YouTube's paid-promotion
+  flag on every recent video plus disclosure phrases in descriptions. When
+  none is seen the term is dropped, never scored zero.
 
 ### Stage B batching
 
@@ -245,9 +335,11 @@ These limits are structural, not bugs, and the UI states them permanently:
 - **Geography is country-level only.** No state or city targeting exists
   anywhere in the YouTube API. A sub-country brief triggers a banner rather than
   being silently upgraded to a country.
-- **No audience demographics exist.** No viewer age, gender, or income data is
-  publicly available, so no agent may state any. Agent 8 treats any such claim
-  as fabricated by definition.
+- **No audience demographics exist.** No measured viewer age, gender, or
+  income data is publicly available. Audience profiles are **inferred** from
+  videos and viewer comments, labelled as inferred in the UI, and backed by
+  quoted evidence. Agent 8 still treats any stated demographic statistic as
+  fabricated by definition.
 - **Transcripts are unavailable** (`captions.download` is owner-only), so
   sponsorship analysis reads descriptions.
 - **Sponsorship disclosure is self-declared and under-reported.** Absence of
@@ -289,13 +381,17 @@ managed Postgres.
 | `web/` | React frontend (Vite, TypeScript, Tailwind) |
 
 | `graph.py` | LangGraph state, node wiring, checkpointer, degradation |
-| `agents.py` | 8 agents, throttle, injection defenses, ID validation |
+| `discovery.py` | Persona, creator scout, pre-screen, pool ranking |
+| `relevance.py` | Brand/buyer context and audience evidence for the judges |
+| `agents.py` | Agents, per-agent model + thinking routing, injection defenses, ID validation |
+| `budget.py` | Measured Gemini spend per month; pauses new searches near the cap |
 | `prompts.py` | System instructions |
 | `schemas.py` | `response_schema` definitions |
 | `youtube.py` | httpx client, batching, `fields`, error taxonomy |
-| `metrics.py` | Scoring math, normalization, confidence |
+| `metrics.py` | Scoring math, normalization, confidence, shortlist tiers |
+| `explain.py` | Plain-language reasons and rounded key numbers per creator |
 | `cache.py` | SQLite cache, quota ledger, agent log |
 | `theme.py` | CSS design system and HTML component builders |
 | `demo_data.py` | Fixtures for demo mode (no API key or quota needed) |
 | `AGENT_GUIDELINES.md` | How the agents should reason (edit this to change behaviour) |
-| `tests/` | 64 tests, no network required |
+| `tests/` | 148 tests, no network required |
